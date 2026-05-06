@@ -1,0 +1,11 @@
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# Editor
+.vscode/
+.idea/
+
+# Schema codegen — checked in, but ignore stray files
+schema/go.capnp
