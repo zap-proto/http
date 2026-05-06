@@ -1,10 +1,12 @@
 // Package zaphttp implements HTTP request/response semantics over the
 // ZAP transport. Existing net/http callers and handlers work
 // unmodified — the package adapts the standard library types to and
-// from Cap'n Proto-encoded ZAP frames.
+// from ZAP frames.
 //
-// The wire format is documented in schema/zap_http.capnp; the Go types
-// in internal/capnp are generated from it.
+// The wire format is documented in schema/zap_http.zap (authored in
+// the ZAP schema language). Go bindings in internal/wire are derived
+// from that schema; today via the zapc + capnp toolchain, replaceable
+// with a hand-rolled encoder once zapc grows a Go backend.
 //
 // What's covered today (v0.1):
 //   - Request method, target, headers, body
@@ -18,9 +20,9 @@
 //   - WebSocket / SSE upgrade paths; those land in zap-proto/ws.
 //
 // This file holds the marshal/unmarshal between *http.Request /
-// http.Response and ZAP frames. It depends only on the standard
-// library plus Cap'n Proto. The transport layer (TCP framing today,
-// PQ-handshake-wrapped ZAP transport in v0.2) lives in transport.go.
+// http.Response and ZAP frames. The transport layer (TCP framing
+// today, PQ-handshake-wrapped ZAP transport in v0.2) lives in
+// transport.go.
 
 package zaphttp
 
@@ -35,7 +37,7 @@ import (
 
 	"capnproto.org/go/capnp/v3"
 
-	zhcapnp "github.com/zap-proto/http/internal/capnp"
+	zhwire "github.com/zap-proto/http/internal/wire"
 )
 
 // MarshalRequest serializes an *http.Request into a ZAP frame. The
@@ -54,7 +56,7 @@ func MarshalRequest(req *http.Request) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	frame, err := zhcapnp.NewRootFrame(seg)
+	frame, err := zhwire.NewRootFrame(seg)
 	if err != nil {
 		return nil, err
 	}
@@ -102,11 +104,11 @@ func UnmarshalRequest(b []byte) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	frame, err := zhcapnp.ReadRootFrame(msg)
+	frame, err := zhwire.ReadRootFrame(msg)
 	if err != nil {
 		return nil, err
 	}
-	if frame.Which() != zhcapnp.Frame_Which_request {
+	if frame.Which() != zhwire.Frame_Which_request {
 		return nil, fmt.Errorf("zaphttp: frame is %s, want request", frame.Which())
 	}
 	r, err := frame.Request()
@@ -179,7 +181,7 @@ func MarshalResponse(resp *http.Response) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	frame, err := zhcapnp.NewRootFrame(seg)
+	frame, err := zhwire.NewRootFrame(seg)
 	if err != nil {
 		return nil, err
 	}
@@ -226,11 +228,11 @@ func UnmarshalResponse(b []byte) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	frame, err := zhcapnp.ReadRootFrame(msg)
+	frame, err := zhwire.ReadRootFrame(msg)
 	if err != nil {
 		return nil, err
 	}
-	if frame.Which() != zhcapnp.Frame_Which_response {
+	if frame.Which() != zhwire.Frame_Which_response {
 		return nil, fmt.Errorf("zaphttp: frame is %s, want response", frame.Which())
 	}
 	r, err := frame.Response()
@@ -291,17 +293,17 @@ func readAllBody(r io.Reader) ([]byte, error) {
 	return io.ReadAll(r)
 }
 
-func writeHeaders(seg *capnp.Segment, h http.Header, setter func(zhcapnp.Header_List) error) error {
+func writeHeaders(seg *capnp.Segment, h http.Header, setter func(zhwire.Header_List) error) error {
 	if len(h) == 0 {
 		// Allocate an empty list so consumers don't see a default-zero
 		// pointer that fails to decode.
-		empty, err := zhcapnp.NewHeader_List(seg, 0)
+		empty, err := zhwire.NewHeader_List(seg, 0)
 		if err != nil {
 			return err
 		}
 		return setter(empty)
 	}
-	list, err := zhcapnp.NewHeader_List(seg, int32(len(h)))
+	list, err := zhwire.NewHeader_List(seg, int32(len(h)))
 	if err != nil {
 		return err
 	}
@@ -328,7 +330,7 @@ func writeHeaders(seg *capnp.Segment, h http.Header, setter func(zhcapnp.Header_
 	return setter(list)
 }
 
-func readHeaders(getter func() (zhcapnp.Header_List, error)) (http.Header, error) {
+func readHeaders(getter func() (zhwire.Header_List, error)) (http.Header, error) {
 	list, err := getter()
 	if err != nil {
 		return nil, err

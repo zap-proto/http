@@ -1,11 +1,11 @@
 # zap-http Makefile.
 #
-# Re-runs Cap'n Proto codegen from schema/zap_http.capnp into
-# internal/capnp/. Requires capnp + capnpc-go on PATH.
+# Re-runs Cap'n Proto codegen from schema/zap_http.zap into
+# internal/wire/. Requires capnp + capnpc-go on PATH.
 
 GOPATH ?= $(shell go env GOPATH)
-SCHEMA := schema/zap_http.capnp
-GENDIR := internal/capnp
+SCHEMA := schema/zap_http.zap
+GENDIR := internal/wire
 
 .PHONY: schema test build bench clean
 
