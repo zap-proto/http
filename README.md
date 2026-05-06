@@ -12,7 +12,7 @@ Drop-in replacement for `net/http` server and client when both peers live in a t
 |---|---|---|
 | Confidentiality | TLS (classical curves) | X-Wing hybrid PQ (X25519 + ML-KEM-768) |
 | Authentication | bearer / JWT at app layer | KEM keypair at transport layer |
-| Wire encoding | text headers + chunked body | Cap'n Proto, zero-copy |
+| Wire encoding | text headers + chunked body | ZAP wire, zero-copy |
 | Field access | parse → allocate → copy | pointer offset, O(1) |
 | JWT mint per call | typical | not in the path |
 
@@ -74,23 +74,23 @@ func main() {
 
 ## Wire format
 
-Each HTTP message is one Cap'n Proto frame (`schema/zap_http.capnp`). Today the wire layer is length-prefixed framing over TCP; the [paper](https://github.com/zap-proto/papers/tree/main/transport-vs-jwt) and the v0.2 release will swap that for the full ZAP transport with X-Wing PQ KEM handshake on connect.
+Each HTTP message is one ZAP frame, defined in [`schema/zap_http.zap`](schema/zap_http.zap) using the ZAP schema language. Today the wire layer is length-prefixed framing over TCP; the [paper](https://github.com/zap-proto/papers/tree/main/transport-vs-jwt) and the v0.2 release will swap that for the full ZAP transport with X-Wing PQ KEM handshake on connect.
 
 ```
 zap-http v0.1 wire (transitional):
   +---------+-------------------+
-  | u32 BE  |   capnp.Frame     |
-  | length  |   (zap_http.capnp)|
+  | u32 BE  |   ZAP Frame       |
+  | length  |   (zap_http.zap)  |
   +---------+-------------------+
 
 zap-http v0.2 wire:
-  +-----------------------------+--------+--------+
-  | ZAP transport (X-Wing KEM,  | AEAD   | capnp  |
-  | mutual auth, multi-stream)  | header | Frame  |
-  +-----------------------------+--------+--------+
+  +-----------------------------+--------+-----------+
+  | ZAP transport (X-Wing KEM,  | AEAD   | ZAP Frame |
+  | mutual auth, multi-stream)  | header |           |
+  +-----------------------------+--------+-----------+
 ```
 
-The Cap'n Proto schema is the source of truth for what's on the wire. Marshal/unmarshal in any language follows from the schema; bindings:
+The `.zap` schema is the source of truth for what's on the wire. Marshal/unmarshal in any language follows from the schema; bindings:
 - Go (this repo)
 - Rust — [`zap-proto/rust`](https://github.com/zap-proto/rust) (consumer; sub-protocol bindings TBD)
 - TypeScript — [`zap-proto/ts`](https://github.com/zap-proto/ts) (planned)
@@ -126,14 +126,14 @@ By the [composability theorem](https://github.com/zap-proto/papers/tree/main/com
 ## Schema regeneration
 
 ```sh
-make schema    # regenerates internal/capnp/zap_http.capnp.go
+make schema    # regenerates internal/wire/zap_http.go from schema/zap_http.zap
 ```
 
-Requires `capnp` (Cap'n Proto compiler) and `capnpc-go`:
+Requires `zapc` (the ZAP schema compiler) on PATH. Build it once from
+[`zap-proto/spec`](https://github.com/zap-proto/spec):
 
 ```sh
-brew install capnp                                  # macOS
-go install capnproto.org/go/capnp/v3/capnpc-go@latest
+cargo install --path .   # from a clone of zap-proto/spec
 ```
 
 ## License
