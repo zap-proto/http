@@ -1,6 +1,6 @@
 # zap-http
 
-> **Docs:** [HTTP over ZAP](https://zap-proto.dev/docs/transports) · part of the [ZAP Protocol](https://zap-proto.io)
+> **Docs:** [HTTP over ZAP](https://zap-proto.dev/docs/protocols/http) · part of the [ZAP Protocol](https://zap-proto.io)
 
 
 HTTP request/response semantics over the [ZAP transport](https://github.com/zap-proto/spec).
