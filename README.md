@@ -1,5 +1,8 @@
 # zap-http
 
+> **Docs:** [HTTP over ZAP](https://zap-proto.dev/docs/transports) · part of the [ZAP Protocol](https://zap-proto.io)
+
+
 HTTP request/response semantics over the [ZAP transport](https://github.com/zap-proto/spec).
 
 [**zap-proto.io**](https://zap-proto.io) · [Spec](https://github.com/zap-proto/spec) · [Paper](https://github.com/zap-proto/papers/tree/main/transport-vs-jwt) · [Discord](https://zap-proto.io/discord)
