@@ -6,6 +6,3 @@
 # Editor
 .vscode/
 .idea/
-
-# Schema codegen — checked in, but ignore stray files
-schema/go.capnp

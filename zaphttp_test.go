@@ -308,3 +308,99 @@ func TestMarshalRequest_idempotent(t *testing.T) {
 		t.Errorf("body mismatch")
 	}
 }
+
+// TestMarshalResponse_idempotent — marshal/unmarshal round-trip
+// preserves response fields exactly, including a reason phrase,
+// multi-value headers, a body, and a trailer. Pure unit test, no
+// network — the symmetric counterpart to TestMarshalRequest_idempotent
+// and the explicit guard on the response frame's field offsets.
+func TestMarshalResponse_idempotent(t *testing.T) {
+	body := []byte("payload-bytes-\x00\x01\x02-with-nuls")
+	orig := &http.Response{
+		StatusCode: http.StatusTeapot,
+		Status:     "418 I'm a teapot",
+		Proto:      "ZAP-HTTP/1.0",
+		Header: http.Header{
+			"Content-Type": {"application/octet-stream"},
+			"X-Multi":      {"one", "two", "three"},
+		},
+		Body:    io.NopCloser(bytes.NewReader(body)),
+		Trailer: http.Header{"X-Checksum": {"deadbeef"}},
+	}
+
+	frame, err := zaphttp.MarshalResponse(orig)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got, err := zaphttp.UnmarshalResponse(frame)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.StatusCode != http.StatusTeapot {
+		t.Errorf("status = %d want 418", got.StatusCode)
+	}
+	if got.Status != "418 I'm a teapot" {
+		t.Errorf("status line = %q want %q", got.Status, "418 I'm a teapot")
+	}
+	if ct := got.Header.Get("Content-Type"); ct != "application/octet-stream" {
+		t.Errorf("Content-Type = %q want application/octet-stream", ct)
+	}
+	if multi := got.Header.Values("X-Multi"); len(multi) != 3 ||
+		multi[0] != "one" || multi[1] != "two" || multi[2] != "three" {
+		t.Errorf("X-Multi = %v want [one two three]", multi)
+	}
+	if cs := got.Trailer.Get("X-Checksum"); cs != "deadbeef" {
+		t.Errorf("trailer X-Checksum = %q want deadbeef", cs)
+	}
+	gotBody, _ := io.ReadAll(got.Body)
+	if !bytes.Equal(gotBody, body) {
+		t.Errorf("body mismatch: got %q want %q", gotBody, body)
+	}
+}
+
+// TestFrameType_crossGuard — a request frame must not decode as a
+// response and vice versa. The frame type rides in the message header
+// flags; the decoder rejects a mismatched type rather than silently
+// misreading another shape's bytes.
+func TestFrameType_crossGuard(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/x", nil)
+	reqFrame, err := zaphttp.MarshalRequest(req)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	if _, err := zaphttp.UnmarshalResponse(reqFrame); err == nil {
+		t.Errorf("UnmarshalResponse accepted a request frame; want error")
+	}
+
+	resp := &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}
+	respFrame, err := zaphttp.MarshalResponse(resp)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	if _, err := zaphttp.UnmarshalRequest(respFrame); err == nil {
+		t.Errorf("UnmarshalRequest accepted a response frame; want error")
+	}
+}
+
+// TestEmptyHeaders_nonNil — a request/response with no headers must
+// decode to an empty, non-nil http.Header (the null-slot path), so
+// callers can Get/Add without a nil-map panic.
+func TestEmptyHeaders_nonNil(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.Header = nil // force the empty-headers encode path
+	frame, err := zaphttp.MarshalRequest(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got, err := zaphttp.UnmarshalRequest(frame)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Header == nil {
+		t.Fatal("decoded request Header is nil; want empty non-nil")
+	}
+	got.Header.Add("X-Added", "ok") // must not panic on a nil map
+	if got.Header.Get("X-Added") != "ok" {
+		t.Errorf("Add to decoded empty Header did not take")
+	}
+}

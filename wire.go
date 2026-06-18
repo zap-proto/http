@@ -4,9 +4,11 @@
 // from ZAP frames.
 //
 // The wire format is documented in schema/zap_http.zap (authored in
-// the ZAP schema language). Go bindings in internal/wire are derived
-// from that schema; today via the zapc + capnp toolchain, replaceable
-// with a hand-rolled encoder once zapc grows a Go backend.
+// the ZAP schema language). The bytes on the wire are
+// github.com/zap-proto/go Objects — the canonical pure-stdlib ZAP
+// runtime — packed at explicit byte offsets within each object's fixed
+// payload. There is no external codec dependency: this file is the
+// encoder and decoder.
 //
 // What's covered today (v0.1):
 //   - Request method, target, headers, body
@@ -19,6 +21,30 @@
 //   - HTTP/2 server push semantics; HTTP/3 priorities.
 //   - WebSocket / SSE upgrade paths; those land in zap-proto/ws.
 //
+// # Wire layout
+//
+// A frame is one zap-proto/go message. The message type rides in the
+// header flags (flags>>8): FrameRequest for a request, FrameResponse
+// for a response — the same discriminator discipline the zap forward
+// envelopes use. There is no union struct; the flag selects which
+// object shape is the message root.
+//
+// # Offset discipline
+//
+// zap-proto/go's ObjectBuilder.SetBytes / SetText write an 8-byte slot
+// at the field offset: {relOffset uint32, length uint32}. The
+// variable-length tail is appended after the fixed section in Finish()
+// and the relOffset is patched to point at it. Consequently EVERY text
+// or bytes field consumes 8 bytes of fixed payload — adjacent text
+// fields MUST be spaced 8 bytes apart or their slots overlap and
+// corrupt each other. Fixed scalars use their natural width on a
+// natural boundary. These offsets are the contract; changing one is a
+// wire break.
+//
+// Headers (and trailers) ride as a JSON map[string][]string — the
+// native shape of http.Header — preserving multi-value semantics
+// (RFC 9110 §5.2) losslessly without a nested-object list.
+//
 // This file holds the marshal/unmarshal between *http.Request /
 // http.Response and ZAP frames. The transport layer (TCP framing
 // today, PQ-handshake-wrapped ZAP transport in v0.2) lives in
@@ -28,6 +54,7 @@ package zaphttp
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,9 +62,41 @@ import (
 	"strconv"
 	"strings"
 
-	"capnproto.org/go/capnp/v3"
+	zap "github.com/zap-proto/go"
+)
 
-	zhwire "github.com/zap-proto/http/internal/wire"
+// Frame type IDs. The ZAP message header carries the type in the upper
+// byte of the 16-bit flags field; FinishWithFlags(t<<8) tags the
+// message and Message.Flags()>>8 recovers it. A request frame and a
+// response frame are the two shapes the wire carries today.
+const (
+	FrameRequest  uint16 = 0x01
+	FrameResponse uint16 = 0x02
+)
+
+// Request frame field offsets within the object's fixed payload. Every
+// text/bytes slot is 8 bytes (relOffset+length); see "Offset
+// discipline" in the package doc.
+const (
+	reqMethod   = 0  // text  (8)
+	reqTarget   = 8  // text  (8)
+	reqProto    = 16 // text  (8)
+	reqHeaders  = 24 // bytes (8) -- JSON map[string][]string
+	reqBody     = 32 // bytes (8)
+	reqTrailer  = 40 // bytes (8) -- JSON map[string][]string
+	reqSlotSize = 48
+)
+
+// Response frame field offsets. status@0 is a uint16 (2 bytes); the
+// first text slot starts at the next 8-byte boundary.
+const (
+	respStatus   = 0  // uint16 (2)
+	respReason   = 8  // text   (8)
+	respProto    = 16 // text   (8)
+	respHeaders  = 24 // bytes  (8) -- JSON map[string][]string
+	respBody     = 32 // bytes  (8)
+	respTrailer  = 40 // bytes  (8) -- JSON map[string][]string
+	respSlotSize = 48
 )
 
 // MarshalRequest serializes an *http.Request into a ZAP frame. The
@@ -52,47 +111,30 @@ func MarshalRequest(req *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("zaphttp: read body: %w", err)
 	}
 
-	msg, seg, err := capnp.NewMessage(capnp.SingleSegment(nil))
-	if err != nil {
-		return nil, err
-	}
-	frame, err := zhwire.NewRootFrame(seg)
-	if err != nil {
-		return nil, err
-	}
-	r, err := frame.NewRequest()
-	if err != nil {
-		return nil, err
-	}
-
-	if err := r.SetMethod(orDefault(req.Method, http.MethodGet)); err != nil {
-		return nil, err
-	}
 	target := req.RequestURI
 	if target == "" && req.URL != nil {
 		target = req.URL.RequestURI()
 	}
-	if err := r.SetTarget(target); err != nil {
-		return nil, err
+	headers, err := encodeHeaders(req.Header)
+	if err != nil {
+		return nil, fmt.Errorf("zaphttp: encode headers: %w", err)
 	}
-	if err := r.SetProto(orDefault(req.Proto, "ZAP-HTTP/1.0")); err != nil {
-		return nil, err
-	}
-	if err := writeHeaders(seg, req.Header, r.SetHeaders); err != nil {
-		return nil, err
-	}
-	if len(body) > 0 {
-		if err := r.SetBody(body); err != nil {
-			return nil, err
-		}
-	}
-	if len(req.Trailer) > 0 {
-		if err := writeHeaders(seg, req.Trailer, r.SetTrailer); err != nil {
-			return nil, err
-		}
+	trailer, err := encodeHeaders(req.Trailer)
+	if err != nil {
+		return nil, fmt.Errorf("zaphttp: encode trailer: %w", err)
 	}
 
-	return msg.Marshal()
+	b := zap.NewBuilder(reqSlotSize + len(body) + len(headers) + len(trailer) +
+		len(req.Method) + len(target) + len(req.Proto) + 64)
+	ob := b.StartObject(reqSlotSize)
+	ob.SetText(reqMethod, orDefault(req.Method, http.MethodGet))
+	ob.SetText(reqTarget, target)
+	ob.SetText(reqProto, orDefault(req.Proto, "ZAP-HTTP/1.0"))
+	ob.SetBytes(reqHeaders, headers)
+	ob.SetBytes(reqBody, body)
+	ob.SetBytes(reqTrailer, trailer)
+	ob.FinishAsRoot()
+	return b.FinishWithFlags(FrameRequest << 8), nil
 }
 
 // UnmarshalRequest reconstructs an *http.Request from a ZAP frame. The
@@ -100,45 +142,26 @@ func MarshalRequest(req *http.Request) ([]byte, error) {
 // bytes; the request URL is parsed from target. Host is taken from the
 // request's Host header (RFC 9110 §7.2).
 func UnmarshalRequest(b []byte) (*http.Request, error) {
-	msg, err := capnp.Unmarshal(b)
+	msg, err := zap.Parse(b)
 	if err != nil {
 		return nil, err
 	}
-	frame, err := zhwire.ReadRootFrame(msg)
-	if err != nil {
-		return nil, err
+	if t := msg.Flags() >> 8; t != FrameRequest {
+		return nil, fmt.Errorf("zaphttp: frame type %#x, want request (%#x)", t, FrameRequest)
 	}
-	if frame.Which() != zhwire.Frame_Which_request {
-		return nil, fmt.Errorf("zaphttp: frame is %s, want request", frame.Which())
-	}
-	r, err := frame.Request()
-	if err != nil {
-		return nil, err
-	}
+	r := msg.Root()
 
-	method, err := r.Method()
+	method := r.Text(reqMethod)
+	target := r.Text(reqTarget)
+	proto := r.Text(reqProto)
+	headers, err := decodeHeaders(r.Bytes(reqHeaders))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("zaphttp: decode headers: %w", err)
 	}
-	target, err := r.Target()
+	body := r.Bytes(reqBody)
+	trailer, err := decodeHeaders(r.Bytes(reqTrailer))
 	if err != nil {
-		return nil, err
-	}
-	proto, err := r.Proto()
-	if err != nil {
-		return nil, err
-	}
-	headers, err := readHeaders(r.Headers)
-	if err != nil {
-		return nil, err
-	}
-	body, err := r.Body()
-	if err != nil {
-		return nil, err
-	}
-	trailer, err := readHeaders(r.Trailer)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("zaphttp: decode trailer: %w", err)
 	}
 
 	u, err := url.ParseRequestURI(target)
@@ -177,89 +200,58 @@ func MarshalResponse(resp *http.Response) ([]byte, error) {
 		return nil, fmt.Errorf("zaphttp: read body: %w", err)
 	}
 
-	msg, seg, err := capnp.NewMessage(capnp.SingleSegment(nil))
-	if err != nil {
-		return nil, err
-	}
-	frame, err := zhwire.NewRootFrame(seg)
-	if err != nil {
-		return nil, err
-	}
-	r, err := frame.NewResponse()
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode == 0 {
-		r.SetStatus(http.StatusOK)
-	} else {
-		r.SetStatus(uint16(resp.StatusCode))
+	status := resp.StatusCode
+	if status == 0 {
+		status = http.StatusOK
 	}
 	reason := resp.Status
 	if i := strings.IndexByte(reason, ' '); i >= 0 {
 		reason = reason[i+1:]
 	}
-	if err := r.SetReason(reason); err != nil {
-		return nil, err
+	headers, err := encodeHeaders(resp.Header)
+	if err != nil {
+		return nil, fmt.Errorf("zaphttp: encode headers: %w", err)
 	}
-	if err := r.SetProto(orDefault(resp.Proto, "ZAP-HTTP/1.0")); err != nil {
-		return nil, err
-	}
-	if err := writeHeaders(seg, resp.Header, r.SetHeaders); err != nil {
-		return nil, err
-	}
-	if len(body) > 0 {
-		if err := r.SetBody(body); err != nil {
-			return nil, err
-		}
-	}
-	if len(resp.Trailer) > 0 {
-		if err := writeHeaders(seg, resp.Trailer, r.SetTrailer); err != nil {
-			return nil, err
-		}
+	trailer, err := encodeHeaders(resp.Trailer)
+	if err != nil {
+		return nil, fmt.Errorf("zaphttp: encode trailer: %w", err)
 	}
 
-	return msg.Marshal()
+	b := zap.NewBuilder(respSlotSize + len(body) + len(headers) + len(trailer) +
+		len(reason) + len(resp.Proto) + 64)
+	ob := b.StartObject(respSlotSize)
+	ob.SetUint16(respStatus, uint16(status))
+	ob.SetText(respReason, reason)
+	ob.SetText(respProto, orDefault(resp.Proto, "ZAP-HTTP/1.0"))
+	ob.SetBytes(respHeaders, headers)
+	ob.SetBytes(respBody, body)
+	ob.SetBytes(respTrailer, trailer)
+	ob.FinishAsRoot()
+	return b.FinishWithFlags(FrameResponse << 8), nil
 }
 
 // UnmarshalResponse reconstructs an *http.Response from a ZAP frame.
 func UnmarshalResponse(b []byte) (*http.Response, error) {
-	msg, err := capnp.Unmarshal(b)
+	msg, err := zap.Parse(b)
 	if err != nil {
 		return nil, err
 	}
-	frame, err := zhwire.ReadRootFrame(msg)
-	if err != nil {
-		return nil, err
+	if t := msg.Flags() >> 8; t != FrameResponse {
+		return nil, fmt.Errorf("zaphttp: frame type %#x, want response (%#x)", t, FrameResponse)
 	}
-	if frame.Which() != zhwire.Frame_Which_response {
-		return nil, fmt.Errorf("zaphttp: frame is %s, want response", frame.Which())
-	}
-	r, err := frame.Response()
-	if err != nil {
-		return nil, err
-	}
+	r := msg.Root()
 
-	status := int(r.Status())
-	reason, err := r.Reason()
+	status := int(r.Uint16(respStatus))
+	reason := r.Text(respReason)
+	proto := r.Text(respProto)
+	headers, err := decodeHeaders(r.Bytes(respHeaders))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("zaphttp: decode headers: %w", err)
 	}
-	proto, err := r.Proto()
+	body := r.Bytes(respBody)
+	trailer, err := decodeHeaders(r.Bytes(respTrailer))
 	if err != nil {
-		return nil, err
-	}
-	headers, err := readHeaders(r.Headers)
-	if err != nil {
-		return nil, err
-	}
-	body, err := r.Body()
-	if err != nil {
-		return nil, err
-	}
-	trailer, err := readHeaders(r.Trailer)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("zaphttp: decode trailer: %w", err)
 	}
 
 	statusText := reason
@@ -293,71 +285,29 @@ func readAllBody(r io.Reader) ([]byte, error) {
 	return io.ReadAll(r)
 }
 
-func writeHeaders(seg *capnp.Segment, h http.Header, setter func(zhwire.Header_List) error) error {
+// encodeHeaders serializes an http.Header as a JSON map[string][]string.
+// An empty header set encodes as nil (the SetBytes null slot), which
+// decodeHeaders maps back to an empty, non-nil http.Header. Header is
+// already map[string][]string, so this is a direct, lossless encoding
+// that preserves multi-value names (RFC 9110 §5.2).
+func encodeHeaders(h http.Header) ([]byte, error) {
 	if len(h) == 0 {
-		// Allocate an empty list so consumers don't see a default-zero
-		// pointer that fails to decode.
-		empty, err := zhwire.NewHeader_List(seg, 0)
-		if err != nil {
-			return err
-		}
-		return setter(empty)
+		return nil, nil
 	}
-	list, err := zhwire.NewHeader_List(seg, int32(len(h)))
-	if err != nil {
-		return err
-	}
-	i := 0
-	for name, values := range h {
-		hdr := list.At(i)
-		if err := hdr.SetName(name); err != nil {
-			return err
-		}
-		vlist, err := capnp.NewTextList(seg, int32(len(values)))
-		if err != nil {
-			return err
-		}
-		for j, v := range values {
-			if err := vlist.Set(j, v); err != nil {
-				return err
-			}
-		}
-		if err := hdr.SetValues(vlist); err != nil {
-			return err
-		}
-		i++
-	}
-	return setter(list)
+	return json.Marshal(h)
 }
 
-func readHeaders(getter func() (zhwire.Header_List, error)) (http.Header, error) {
-	list, err := getter()
-	if err != nil {
-		return nil, err
-	}
-	if list.Len() == 0 {
+// decodeHeaders is the inverse of encodeHeaders. A null/empty slot
+// yields an empty, non-nil http.Header so callers never see a nil map.
+func decodeHeaders(b []byte) (http.Header, error) {
+	if len(b) == 0 {
 		return http.Header{}, nil
 	}
-	out := make(http.Header, list.Len())
-	for i := 0; i < list.Len(); i++ {
-		h := list.At(i)
-		name, err := h.Name()
-		if err != nil {
-			return nil, err
-		}
-		vlist, err := h.Values()
-		if err != nil {
-			return nil, err
-		}
-		for j := 0; j < vlist.Len(); j++ {
-			v, err := vlist.At(j)
-			if err != nil {
-				return nil, err
-			}
-			out.Add(name, v)
-		}
+	h := http.Header{}
+	if err := json.Unmarshal(b, &h); err != nil {
+		return nil, err
 	}
-	return out, nil
+	return h, nil
 }
 
 func orDefault(s, fallback string) string {
