@@ -1,19 +1,18 @@
 // Minimal zap-http example: server + client in one binary.
 //
-//   go run ./examples/hello server :9999
-//   go run ./examples/hello client :9999
+//	go run ./examples/hello server :9999
+//	go run ./examples/hello client :9999
 //
-// The server speaks ZAP-HTTP on :9999. The client dials, issues
-// GET /hello, and prints the response body.
+// The server speaks ZAP-HTTP on :9999 with a fasthttp handler. The client
+// dials, issues GET /hello, and prints the response body.
 
 package main
 
 import (
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 
+	"github.com/valyala/fasthttp"
 	zaphttp "github.com/zap-proto/http"
 )
 
@@ -26,25 +25,24 @@ func main() {
 
 	switch role {
 	case "server":
-		http.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "text/plain")
-			fmt.Fprintf(w, "hello from %s — you said %s %s\n", addr, r.Method, r.URL.Path)
-		})
+		handler := func(ctx *fasthttp.RequestCtx) {
+			ctx.Response.Header.Set("Content-Type", "text/plain")
+			fmt.Fprintf(ctx, "hello from %s — you said %s %s\n", addr, ctx.Method(), ctx.Path())
+		}
 		fmt.Printf("zap-http server listening on %s\n", addr)
-		if err := zaphttp.ListenAndServe(addr, nil); err != nil {
+		if err := zaphttp.ListenAndServe(addr, handler); err != nil {
 			fmt.Fprintln(os.Stderr, "server:", err)
 			os.Exit(1)
 		}
 	case "client":
-		client := &http.Client{Transport: zaphttp.NewTransport(addr)}
-		resp, err := client.Get("http://" + addr + "/hello")
+		resp, err := zaphttp.Get(addr, "/hello")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "client:", err)
 			os.Exit(1)
 		}
-		defer resp.Body.Close()
-		fmt.Printf("← %s\n", resp.Status)
-		io.Copy(os.Stdout, resp.Body)
+		defer fasthttp.ReleaseResponse(resp)
+		fmt.Printf("← %d %s\n", resp.StatusCode(), fasthttp.StatusMessage(resp.StatusCode()))
+		os.Stdout.Write(resp.Body())
 	default:
 		fmt.Fprintln(os.Stderr, "role must be 'server' or 'client'")
 		os.Exit(2)
