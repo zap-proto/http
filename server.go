@@ -1,56 +1,52 @@
-// Server — net/http.Handler-compatible server speaking ZAP-HTTP.
+// Server — a fasthttp.RequestHandler served over ZAP-HTTP.
 //
-// Existing handlers work unchanged:
+// A Fiber app (or any fasthttp stack) hands its handler straight in:
 //
-//   mux := http.NewServeMux()
-//   mux.HandleFunc("/healthz", okHandler)
-//   zaphttp.ListenAndServe(":9999", mux)
+//	srv := &zaphttp.Server{Addr: ":9999", Handler: app.Handler()}
+//	srv.ListenAndServe()
 //
 // The server reads ZAP-HTTP frames off each accepted connection,
-// reconstructs *http.Request, dispatches to the handler, captures the
-// handler's response via a buffering ResponseWriter, and writes one
-// response frame back. Connections are kept alive across requests.
+// reconstructs a *fasthttp.RequestCtx, dispatches to the handler, and
+// writes one response frame back from the ctx's Response. Connections are
+// kept alive across requests. There is no net/http anywhere in the path.
 
 package zaphttp
 
 import (
 	"bufio"
-	"bytes"
-	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
-	"strconv"
 	"sync"
 	"time"
+
+	"github.com/valyala/fasthttp"
 )
 
-// Server is a ZAP-HTTP server. Zero-value is usable; common knobs
-// (Addr, Handler, ReadTimeout, …) mirror net/http.Server.
+// Server is a ZAP-HTTP server. Zero-value is usable; common knobs (Addr,
+// Handler, ReadTimeout, …) mirror fasthttp.Server.
 type Server struct {
-	Addr           string        // ":9999" if empty
-	Handler        http.Handler  // http.DefaultServeMux if nil
-	ReadTimeout    time.Duration // 0 means no timeout
-	WriteTimeout   time.Duration
-	IdleTimeout    time.Duration
-	MaxHeaderBytes int           // not enforced today; placeholder for parity
+	Addr         string                    // ":9999" if empty
+	Handler      fasthttp.RequestHandler   // required
+	ReadTimeout  time.Duration             // 0 means no timeout
+	WriteTimeout time.Duration
+	IdleTimeout  time.Duration
+	Logger       fasthttp.Logger // passed to each RequestCtx; nil is fine
 
 	mu       sync.Mutex
 	listener net.Listener
 	closed   bool
 }
 
-// ListenAndServe is the convenience equivalent of net/http.ListenAndServe.
-func ListenAndServe(addr string, handler http.Handler) error {
+// ListenAndServe is the convenience equivalent of fasthttp.ListenAndServe.
+func ListenAndServe(addr string, handler fasthttp.RequestHandler) error {
 	s := &Server{Addr: addr, Handler: handler}
 	return s.ListenAndServe()
 }
 
-// ListenAndServe binds Addr and serves until Close is called or a
-// fatal accept error occurs.
+// ListenAndServe binds Addr and serves until Close is called or a fatal
+// accept error occurs.
 func (s *Server) ListenAndServe() error {
 	addr := s.Addr
 	if addr == "" {
@@ -70,9 +66,8 @@ func (s *Server) Serve(ln net.Listener) error {
 	s.listener = ln
 	s.mu.Unlock()
 
-	handler := s.Handler
-	if handler == nil {
-		handler = http.DefaultServeMux
+	if s.Handler == nil {
+		return errors.New("zaphttp: Server.Handler is nil")
 	}
 
 	for {
@@ -90,13 +85,14 @@ func (s *Server) Serve(ln net.Listener) error {
 			}
 			return err
 		}
-		go s.serveConn(conn, handler)
+		go s.serveConn(conn)
 	}
 }
 
-func (s *Server) serveConn(conn net.Conn, handler http.Handler) {
+func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
 	br := bufio.NewReader(conn)
+	remoteAddr := conn.RemoteAddr()
 
 	for {
 		if s.IdleTimeout > 0 {
@@ -112,53 +108,34 @@ func (s *Server) serveConn(conn net.Conn, handler http.Handler) {
 		if s.ReadTimeout > 0 {
 			_ = conn.SetReadDeadline(time.Now().Add(s.ReadTimeout))
 		}
-		req, err := UnmarshalRequest(raw)
-		if err != nil {
-			s.writeError(conn, http.StatusBadRequest, "malformed request frame: "+err.Error())
+
+		var req fasthttp.Request
+		if err := UnmarshalRequest(raw, &req); err != nil {
+			s.writeError(conn, fasthttp.StatusBadRequest, "malformed request frame: "+err.Error())
 			return
 		}
-		req.RemoteAddr = conn.RemoteAddr().String()
 
-		// Wire a buffering ResponseWriter. The handler runs to
-		// completion and we then marshal the captured state into a
-		// single response frame. v0.2 will swap this for a streaming
-		// writer once the transport supports it.
-		rw := &bufferingResponseWriter{
-			header: make(http.Header),
-			body:   &bytes.Buffer{},
-		}
-		ctx := context.Background()
-		req = req.WithContext(ctx)
+		// Fresh ctx per request: fasthttp's Init resets connection state and
+		// copies the request in, but does not reset a reused Response, so a
+		// zero-value ctx is the clean, correct choice.
+		ctx := &fasthttp.RequestCtx{}
+		ctx.Init(&req, remoteAddr, s.Logger)
 
-		// Defer-recover so a handler panic returns 500 rather than
-		// dropping the connection silently.
+		// Defer-recover so a handler panic returns 500 rather than dropping
+		// the connection silently.
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					if !rw.wroteHeader {
-						rw.WriteHeader(http.StatusInternalServerError)
-					}
-					log.Printf("zaphttp: handler panic on %s %s: %v", req.Method, req.URL.RequestURI(), r)
+					ctx.Response.Reset()
+					ctx.Response.SetStatusCode(fasthttp.StatusInternalServerError)
+					log.Printf("zaphttp: handler panic on %s %s: %v",
+						ctx.Method(), ctx.RequestURI(), r)
 				}
 			}()
-			handler.ServeHTTP(rw, req)
+			s.Handler(ctx)
 		}()
 
-		if !rw.wroteHeader {
-			rw.WriteHeader(http.StatusOK)
-		}
-		// Auto-fill Content-Length when the handler hasn't.
-		if rw.header.Get("Content-Length") == "" {
-			rw.header.Set("Content-Length", strconv.Itoa(rw.body.Len()))
-		}
-
-		resp := &http.Response{
-			StatusCode: rw.status,
-			Status:     fmt.Sprintf("%d %s", rw.status, http.StatusText(rw.status)),
-			Header:     rw.header,
-			Body:       io.NopCloser(rw.body),
-		}
-		respBytes, err := MarshalResponse(resp)
+		respBytes, err := MarshalResponse(&ctx.Response)
 		if err != nil {
 			log.Printf("zaphttp: marshal response: %v", err)
 			return
@@ -176,13 +153,11 @@ func (s *Server) serveConn(conn net.Conn, handler http.Handler) {
 }
 
 func (s *Server) writeError(w io.Writer, status int, msg string) {
-	resp := &http.Response{
-		StatusCode: status,
-		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
-		Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
-		Body:       io.NopCloser(bytes.NewBufferString(msg)),
-	}
-	frame, err := MarshalResponse(resp)
+	var resp fasthttp.Response
+	resp.SetStatusCode(status)
+	resp.Header.SetContentType("text/plain; charset=utf-8")
+	resp.SetBodyString(msg)
+	frame, err := MarshalResponse(&resp)
 	if err != nil {
 		return
 	}
@@ -198,32 +173,6 @@ func (s *Server) Close() error {
 		return nil
 	}
 	return s.listener.Close()
-}
-
-// ---- bufferingResponseWriter ----
-
-type bufferingResponseWriter struct {
-	header      http.Header
-	body        *bytes.Buffer
-	status      int
-	wroteHeader bool
-}
-
-func (w *bufferingResponseWriter) Header() http.Header { return w.header }
-
-func (w *bufferingResponseWriter) Write(b []byte) (int, error) {
-	if !w.wroteHeader {
-		w.WriteHeader(http.StatusOK)
-	}
-	return w.body.Write(b)
-}
-
-func (w *bufferingResponseWriter) WriteHeader(status int) {
-	if w.wroteHeader {
-		return
-	}
-	w.status = status
-	w.wroteHeader = true
 }
 
 func isClosedConn(err error) bool {

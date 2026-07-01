@@ -1,16 +1,28 @@
 // Package zaphttp implements HTTP request/response semantics over the
-// ZAP transport. Existing net/http callers and handlers work
-// unmodified — the package adapts the standard library types to and
-// from ZAP frames.
+// ZAP transport for the fasthttp handler model. A fasthttp.RequestHandler
+// is served over ZAP frames; a fasthttp.Request/Response pair is exchanged
+// by the client. There is no net/http in the request path — Fiber and
+// every other fasthttp stack hand their handler straight to this package.
 //
-// The wire format is documented in schema/zap_http.zap (authored in
-// the ZAP schema language). The bytes on the wire are
-// github.com/zap-proto/go Objects — the canonical pure-stdlib ZAP
-// runtime — packed at explicit byte offsets within each object's fixed
-// payload. There is no external codec dependency: this file is the
-// encoder and decoder.
+// The wire format is documented in schema/zap_http.zap (authored in the
+// ZAP schema language). The bytes on the wire are github.com/zap-proto/go
+// Objects — the canonical pure-stdlib ZAP runtime — packed at explicit
+// byte offsets within each object's fixed payload. There is no external
+// codec dependency: this file is the encoder and decoder.
 //
-// What's covered today (v0.1):
+// # Wire compatibility
+//
+// The frame format is UNCHANGED from the prior net/http codec — same
+// object slots, same offsets, same JSON header map, same flags
+// discriminator. Only the Go type the codec reads from and writes to
+// changed (net/http → fasthttp). Frames produced here are byte-identical
+// to the frames the previous net/http codec produced for the same logical
+// message, so a fasthttp-based peer and a net/http-based peer interoperate
+// on the wire. This is verified by golden-byte tests (zaphttp_test.go)
+// that decode frames captured from the previous codec and re-encode them
+// to the same bytes.
+//
+// What's covered:
 //   - Request method, target, headers, body
 //   - Response status, reason, headers, body
 //   - Trailers (read and write)
@@ -18,65 +30,69 @@
 // What's not yet covered:
 //   - Streaming bodies — the entire body must fit in one frame; the
 //     transport negotiates a max frame size on connection setup.
-//   - HTTP/2 server push semantics; HTTP/3 priorities.
 //   - WebSocket / SSE upgrade paths; those land in zap-proto/ws.
 //
 // # Wire layout
 //
 // A frame is one zap-proto/go message. The message type rides in the
-// header flags (flags>>8): FrameRequest for a request, FrameResponse
-// for a response — the same discriminator discipline the zap forward
-// envelopes use. There is no union struct; the flag selects which
-// object shape is the message root.
+// header flags (flags>>8): FrameRequest for a request, FrameResponse for
+// a response. There is no union struct; the flag selects which object
+// shape is the message root.
 //
 // # Offset discipline
 //
-// zap-proto/go's ObjectBuilder.SetBytes / SetText write an 8-byte slot
-// at the field offset: {relOffset uint32, length uint32}. The
-// variable-length tail is appended after the fixed section in Finish()
-// and the relOffset is patched to point at it. Consequently EVERY text
-// or bytes field consumes 8 bytes of fixed payload — adjacent text
-// fields MUST be spaced 8 bytes apart or their slots overlap and
-// corrupt each other. Fixed scalars use their natural width on a
-// natural boundary. These offsets are the contract; changing one is a
-// wire break.
+// zap-proto/go's ObjectBuilder.SetBytes / SetText write an 8-byte slot at
+// the field offset: {relOffset uint32, length uint32}. The variable-length
+// tail is appended after the fixed section in Finish() and the relOffset
+// is patched to point at it. Consequently EVERY text or bytes field
+// consumes 8 bytes of fixed payload — adjacent text fields MUST be spaced
+// 8 bytes apart or their slots overlap and corrupt each other. Fixed
+// scalars use their natural width on a natural boundary. These offsets are
+// the contract; changing one is a wire break.
 //
-// Headers (and trailers) ride as a JSON map[string][]string — the
-// native shape of http.Header — preserving multi-value semantics
-// (RFC 9110 §5.2) losslessly without a nested-object list.
+// # Framing metadata vs headers
 //
-// This file holds the marshal/unmarshal between *http.Request /
-// http.Response and ZAP frames. The transport layer (TCP framing
-// today, PQ-handshake-wrapped ZAP transport in v0.2) lives in
-// transport.go.
+// Three fields are owned by the frame, not the headers slot, exactly as
+// the reference net/http codec treated them:
+//
+//   - Content-Length — the frame length-prefixes the body, so body length
+//     is authoritative; it is reconstructed on decode, never carried in
+//     the headers map.
+//   - Host — request routing metadata; carried in fasthttp's Host slot,
+//     not the headers map (matching net/http, which keeps Host out of
+//     Header).
+//   - Trailer (the meta-header listing trailer names) — represented by the
+//     dedicated trailer slot, not the headers map.
+//
+// Everything else fasthttp exposes (Content-Type, User-Agent, Cookie,
+// Authorization, X-*, Set-Cookie, …) rides in the headers slot as a JSON
+// map[string][]string — the native lossless shape for multi-value header
+// names (RFC 9110 §5.2).
 
 package zaphttp
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"strconv"
+	"net/textproto"
 	"strings"
 
+	"github.com/valyala/fasthttp"
 	zap "github.com/zap-proto/go"
 )
 
 // Frame type IDs. The ZAP message header carries the type in the upper
-// byte of the 16-bit flags field; FinishWithFlags(t<<8) tags the
-// message and Message.Flags()>>8 recovers it. A request frame and a
-// response frame are the two shapes the wire carries today.
+// byte of the 16-bit flags field; FinishWithFlags(t<<8) tags the message
+// and Message.Flags()>>8 recovers it. A request frame and a response frame
+// are the two shapes the wire carries today.
 const (
 	FrameRequest  uint16 = 0x01
 	FrameResponse uint16 = 0x02
 )
 
 // Request frame field offsets within the object's fixed payload. Every
-// text/bytes slot is 8 bytes (relOffset+length); see "Offset
-// discipline" in the package doc.
+// text/bytes slot is 8 bytes (relOffset+length); see "Offset discipline"
+// in the package doc.
 const (
 	reqMethod   = 0  // text  (8)
 	reqTarget   = 8  // text  (8)
@@ -87,8 +103,8 @@ const (
 	reqSlotSize = 48
 )
 
-// Response frame field offsets. status@0 is a uint16 (2 bytes); the
-// first text slot starts at the next 8-byte boundary.
+// Response frame field offsets. status@0 is a uint16 (2 bytes); the first
+// text slot starts at the next 8-byte boundary.
 const (
 	respStatus   = 0  // uint16 (2)
 	respReason   = 8  // text   (8)
@@ -99,37 +115,35 @@ const (
 	respSlotSize = 48
 )
 
-// MarshalRequest serializes an *http.Request into a ZAP frame. The
-// returned bytes are framed and ready for transport.Write — the
-// transport layer prepends the length prefix.
-//
-// The body is fully read and consumed; callers that need to reuse the
-// request must replace req.Body with a fresh reader after this call.
-func MarshalRequest(req *http.Request) ([]byte, error) {
-	body, err := readAllBody(req.Body)
-	if err != nil {
-		return nil, fmt.Errorf("zaphttp: read body: %w", err)
-	}
+// defaultProto is the proto string written when the source carries none.
+// fasthttp always reports a protocol ("HTTP/1.1" by default), so this
+// only guards a hand-built zero-value header.
+const defaultProto = "ZAP-HTTP/1.0"
 
-	target := req.RequestURI
-	if target == "" && req.URL != nil {
-		target = req.URL.RequestURI()
-	}
-	headers, err := encodeHeaders(req.Header)
+// MarshalRequest serializes a *fasthttp.Request into a ZAP frame. The
+// returned bytes are the ZAP message; the transport layer prepends the
+// length prefix (see transport.go).
+func MarshalRequest(req *fasthttp.Request) ([]byte, error) {
+	method := string(req.Header.Method())
+	target := string(req.RequestURI())
+	proto := string(req.Header.Protocol())
+	body := req.Body()
+
+	headers, err := encodeHeaderMap(collectRequestHeaders(&req.Header))
 	if err != nil {
 		return nil, fmt.Errorf("zaphttp: encode headers: %w", err)
 	}
-	trailer, err := encodeHeaders(req.Trailer)
+	trailer, err := encodeHeaderMap(collectTrailers(&req.Header))
 	if err != nil {
 		return nil, fmt.Errorf("zaphttp: encode trailer: %w", err)
 	}
 
 	b := zap.NewBuilder(reqSlotSize + len(body) + len(headers) + len(trailer) +
-		len(req.Method) + len(target) + len(req.Proto) + 64)
+		len(method) + len(target) + len(proto) + 64)
 	ob := b.StartObject(reqSlotSize)
-	ob.SetText(reqMethod, orDefault(req.Method, http.MethodGet))
+	ob.SetText(reqMethod, orDefault(method, fasthttp.MethodGet))
 	ob.SetText(reqTarget, target)
-	ob.SetText(reqProto, orDefault(req.Proto, "ZAP-HTTP/1.0"))
+	ob.SetText(reqProto, orDefault(proto, defaultProto))
 	ob.SetBytes(reqHeaders, headers)
 	ob.SetBytes(reqBody, body)
 	ob.SetBytes(reqTrailer, trailer)
@@ -137,92 +151,71 @@ func MarshalRequest(req *http.Request) ([]byte, error) {
 	return b.FinishWithFlags(FrameRequest << 8), nil
 }
 
-// UnmarshalRequest reconstructs an *http.Request from a ZAP frame. The
-// returned request has Body set to a bytes.Reader over the frame's body
-// bytes; the request URL is parsed from target. Host is taken from the
-// request's Host header (RFC 9110 §7.2).
-func UnmarshalRequest(b []byte) (*http.Request, error) {
-	msg, err := zap.Parse(b)
+// UnmarshalRequest reconstructs a request into dst from a ZAP frame. dst is
+// reset first, then populated: method, request-URI, protocol, headers,
+// trailers, and body. Content-Length is derived from the body length by
+// SetBody; Host is taken from a Host header if the frame carried one.
+func UnmarshalRequest(frame []byte, dst *fasthttp.Request) error {
+	msg, err := zap.Parse(frame)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if t := msg.Flags() >> 8; t != FrameRequest {
-		return nil, fmt.Errorf("zaphttp: frame type %#x, want request (%#x)", t, FrameRequest)
+		return fmt.Errorf("zaphttp: frame type %#x, want request (%#x)", t, FrameRequest)
 	}
 	r := msg.Root()
 
 	method := r.Text(reqMethod)
 	target := r.Text(reqTarget)
 	proto := r.Text(reqProto)
-	headers, err := decodeHeaders(r.Bytes(reqHeaders))
-	if err != nil {
-		return nil, fmt.Errorf("zaphttp: decode headers: %w", err)
-	}
+	headers := r.Bytes(reqHeaders)
 	body := r.Bytes(reqBody)
-	trailer, err := decodeHeaders(r.Bytes(reqTrailer))
-	if err != nil {
-		return nil, fmt.Errorf("zaphttp: decode trailer: %w", err)
-	}
+	trailer := r.Bytes(reqTrailer)
 
-	u, err := url.ParseRequestURI(target)
-	if err != nil {
-		// Best-effort: keep the raw target so handlers can inspect it,
-		// but failing here would break callers that only need RequestURI.
-		u = &url.URL{Path: target}
+	dst.Reset()
+	dst.Header.SetMethod(orDefault(method, fasthttp.MethodGet))
+	dst.SetRequestURI(target)
+	if proto != "" {
+		dst.Header.SetProtocol(proto)
 	}
-
-	out := &http.Request{
-		Method:     orDefault(method, http.MethodGet),
-		URL:        u,
-		Proto:      orDefault(proto, "ZAP-HTTP/1.0"),
-		ProtoMajor: 1,
-		ProtoMinor: 0,
-		Header:     headers,
-		Body:       io.NopCloser(bytes.NewReader(body)),
-		Host:       headers.Get("Host"),
-		RequestURI: target,
-		Trailer:    trailer,
+	if err := applyHeadersToRequest(&dst.Header, headers); err != nil {
+		return fmt.Errorf("zaphttp: decode headers: %w", err)
 	}
-	if cl := headers.Get("Content-Length"); cl != "" {
-		if n, err := strconv.ParseInt(cl, 10, 64); err == nil {
-			out.ContentLength = n
-		}
-	} else {
-		out.ContentLength = int64(len(body))
+	if err := applyTrailers(&dst.Header, trailer); err != nil {
+		return fmt.Errorf("zaphttp: decode trailer: %w", err)
 	}
-	return out, nil
+	dst.SetBody(body)
+	return nil
 }
 
-// MarshalResponse serializes an *http.Response into a ZAP frame.
-func MarshalResponse(resp *http.Response) ([]byte, error) {
-	body, err := readAllBody(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("zaphttp: read body: %w", err)
-	}
-
-	status := resp.StatusCode
+// MarshalResponse serializes a *fasthttp.Response into a ZAP frame.
+func MarshalResponse(resp *fasthttp.Response) ([]byte, error) {
+	status := resp.StatusCode()
 	if status == 0 {
-		status = http.StatusOK
+		status = fasthttp.StatusOK
 	}
-	reason := resp.Status
-	if i := strings.IndexByte(reason, ' '); i >= 0 {
-		reason = reason[i+1:]
+	reason := string(resp.Header.StatusMessage())
+	if reason == "" {
+		reason = fasthttp.StatusMessage(status)
 	}
-	headers, err := encodeHeaders(resp.Header)
+	proto := string(resp.Header.Protocol())
+	body := resp.Body()
+
+	headers, err := encodeHeaderMap(collectResponseHeaders(&resp.Header))
 	if err != nil {
 		return nil, fmt.Errorf("zaphttp: encode headers: %w", err)
 	}
-	trailer, err := encodeHeaders(resp.Trailer)
+	trailer, err := encodeHeaderMap(collectTrailers(&resp.Header))
 	if err != nil {
 		return nil, fmt.Errorf("zaphttp: encode trailer: %w", err)
 	}
 
 	b := zap.NewBuilder(respSlotSize + len(body) + len(headers) + len(trailer) +
-		len(reason) + len(resp.Proto) + 64)
+		len(reason) + len(proto) + 64)
 	ob := b.StartObject(respSlotSize)
 	ob.SetUint16(respStatus, uint16(status))
 	ob.SetText(respReason, reason)
-	ob.SetText(respProto, orDefault(resp.Proto, "ZAP-HTTP/1.0"))
+	ob.SetText(respProto, orDefault(proto, defaultProto))
 	ob.SetBytes(respHeaders, headers)
 	ob.SetBytes(respBody, body)
 	ob.SetBytes(respTrailer, trailer)
@@ -230,84 +223,211 @@ func MarshalResponse(resp *http.Response) ([]byte, error) {
 	return b.FinishWithFlags(FrameResponse << 8), nil
 }
 
-// UnmarshalResponse reconstructs an *http.Response from a ZAP frame.
-func UnmarshalResponse(b []byte) (*http.Response, error) {
-	msg, err := zap.Parse(b)
+// UnmarshalResponse reconstructs a response into dst from a ZAP frame.
+func UnmarshalResponse(frame []byte, dst *fasthttp.Response) error {
+	msg, err := zap.Parse(frame)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if t := msg.Flags() >> 8; t != FrameResponse {
-		return nil, fmt.Errorf("zaphttp: frame type %#x, want response (%#x)", t, FrameResponse)
+		return fmt.Errorf("zaphttp: frame type %#x, want response (%#x)", t, FrameResponse)
 	}
 	r := msg.Root()
 
 	status := int(r.Uint16(respStatus))
 	reason := r.Text(respReason)
 	proto := r.Text(respProto)
-	headers, err := decodeHeaders(r.Bytes(respHeaders))
-	if err != nil {
-		return nil, fmt.Errorf("zaphttp: decode headers: %w", err)
-	}
+	headers := r.Bytes(respHeaders)
 	body := r.Bytes(respBody)
-	trailer, err := decodeHeaders(r.Bytes(respTrailer))
-	if err != nil {
-		return nil, fmt.Errorf("zaphttp: decode trailer: %w", err)
-	}
+	trailer := r.Bytes(respTrailer)
 
-	statusText := reason
-	if statusText == "" {
-		statusText = http.StatusText(status)
+	dst.Reset()
+	dst.SetStatusCode(status)
+	if reason != "" {
+		dst.Header.SetStatusMessage([]byte(reason))
 	}
-	return &http.Response{
-		Status:        fmt.Sprintf("%d %s", status, statusText),
-		StatusCode:    status,
-		Proto:         orDefault(proto, "ZAP-HTTP/1.0"),
-		ProtoMajor:    1,
-		ProtoMinor:    0,
-		Header:        headers,
-		Body:          io.NopCloser(bytes.NewReader(body)),
-		ContentLength: int64(len(body)),
-		Trailer:       trailer,
-	}, nil
+	if proto != "" {
+		dst.Header.SetProtocol([]byte(proto))
+	}
+	if err := applyHeadersToResponse(&dst.Header, headers); err != nil {
+		return fmt.Errorf("zaphttp: decode headers: %w", err)
+	}
+	if err := applyTrailers(&dst.Header, trailer); err != nil {
+		return fmt.Errorf("zaphttp: decode trailer: %w", err)
+	}
+	dst.SetBody(body)
+	return nil
 }
 
-// ---- helpers ----
+// ---- header extraction (fasthttp -> map) ----
 
-func readAllBody(r io.Reader) ([]byte, error) {
-	if r == nil {
-		return nil, nil
-	}
-	defer func() {
-		if c, ok := r.(io.Closer); ok {
-			_ = c.Close()
+// collectRequestHeaders walks a request's headers into a map[string][]string,
+// dropping the frame-owned fields (Host, Content-Length, the Trailer
+// meta-header, and any declared-trailer values which ride in the trailer
+// slot instead).
+func collectRequestHeaders(h *fasthttp.RequestHeader) map[string][]string {
+	skip := trailerKeySet(h)
+	m := map[string][]string{}
+	h.VisitAll(func(key, value []byte) {
+		k := string(key)
+		if isFrameOwnedHeader(k) || skip[textproto.CanonicalMIMEHeaderKey(k)] {
+			return
 		}
-	}()
-	return io.ReadAll(r)
+		m[k] = append(m[k], string(value))
+	})
+	return m
 }
 
-// encodeHeaders serializes an http.Header as a JSON map[string][]string.
-// An empty header set encodes as nil (the SetBytes null slot), which
-// decodeHeaders maps back to an empty, non-nil http.Header. Header is
-// already map[string][]string, so this is a direct, lossless encoding
-// that preserves multi-value names (RFC 9110 §5.2).
-func encodeHeaders(h http.Header) ([]byte, error) {
-	if len(h) == 0 {
+// collectResponseHeaders is the response counterpart of
+// collectRequestHeaders. Responses have no Host, but the same
+// Content-Length / Trailer-meta / declared-trailer exclusions apply.
+func collectResponseHeaders(h *fasthttp.ResponseHeader) map[string][]string {
+	skip := trailerKeySet(h)
+	m := map[string][]string{}
+	h.VisitAll(func(key, value []byte) {
+		k := string(key)
+		if isFrameOwnedHeader(k) || skip[textproto.CanonicalMIMEHeaderKey(k)] {
+			return
+		}
+		m[k] = append(m[k], string(value))
+	})
+	return m
+}
+
+// collectTrailers reads declared trailer names and their values (stored in
+// the general header store) into a map[string][]string. Works for both
+// request and response headers via the trailerHeader interface.
+func collectTrailers(h trailerHeader) map[string][]string {
+	keys := h.PeekTrailerKeys()
+	if len(keys) == 0 {
+		return nil
+	}
+	m := map[string][]string{}
+	for _, k := range keys {
+		ck := textproto.CanonicalMIMEHeaderKey(string(k))
+		for _, v := range h.PeekAll(string(k)) {
+			m[ck] = append(m[ck], string(v))
+		}
+	}
+	return m
+}
+
+// trailerHeader is the shared subset of *fasthttp.RequestHeader and
+// *fasthttp.ResponseHeader used to read declared trailers.
+type trailerHeader interface {
+	PeekTrailerKeys() [][]byte
+	PeekAll(key string) [][]byte
+}
+
+// trailerKeySet returns the canonicalized set of declared trailer names so
+// their values can be excluded from the headers slot (they belong in the
+// trailer slot).
+func trailerKeySet(h trailerHeader) map[string]bool {
+	keys := h.PeekTrailerKeys()
+	if len(keys) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		set[textproto.CanonicalMIMEHeaderKey(string(k))] = true
+	}
+	return set
+}
+
+// isFrameOwnedHeader reports whether a header name is owned by the ZAP
+// frame rather than the headers map: Host and Content-Length are
+// reconstructed at the boundary, and "Trailer" is represented by the
+// trailer slot.
+func isFrameOwnedHeader(key string) bool {
+	return strings.EqualFold(key, fasthttp.HeaderHost) ||
+		strings.EqualFold(key, fasthttp.HeaderContentLength) ||
+		strings.EqualFold(key, fasthttp.HeaderTrailer)
+}
+
+// encodeHeaderMap serializes a header map as JSON. An empty map encodes as
+// nil (the SetBytes null slot), which the decode side maps back to no
+// headers — byte-identical to the reference codec's empty-header path.
+func encodeHeaderMap(m map[string][]string) ([]byte, error) {
+	if len(m) == 0 {
 		return nil, nil
 	}
-	return json.Marshal(h)
+	return json.Marshal(m)
 }
 
-// decodeHeaders is the inverse of encodeHeaders. A null/empty slot
-// yields an empty, non-nil http.Header so callers never see a nil map.
-func decodeHeaders(b []byte) (http.Header, error) {
+// ---- header application (map -> fasthttp) ----
+
+func decodeHeaderMap(b []byte) (map[string][]string, error) {
 	if len(b) == 0 {
-		return http.Header{}, nil
+		return nil, nil
 	}
-	h := http.Header{}
-	if err := json.Unmarshal(b, &h); err != nil {
+	m := map[string][]string{}
+	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, err
 	}
-	return h, nil
+	return m, nil
+}
+
+func applyHeadersToRequest(h *fasthttp.RequestHeader, raw []byte) error {
+	m, err := decodeHeaderMap(raw)
+	if err != nil {
+		return err
+	}
+	for k, vals := range m {
+		switch {
+		case strings.EqualFold(k, fasthttp.HeaderHost):
+			if len(vals) > 0 {
+				h.SetHost(vals[len(vals)-1])
+			}
+		case strings.EqualFold(k, fasthttp.HeaderContentLength):
+			// frame-owned; SetBody sets the authoritative length.
+		default:
+			for _, v := range vals {
+				h.Add(k, v)
+			}
+		}
+	}
+	return nil
+}
+
+func applyHeadersToResponse(h *fasthttp.ResponseHeader, raw []byte) error {
+	m, err := decodeHeaderMap(raw)
+	if err != nil {
+		return err
+	}
+	for k, vals := range m {
+		if strings.EqualFold(k, fasthttp.HeaderContentLength) {
+			continue // frame-owned
+		}
+		for _, v := range vals {
+			h.Add(k, v)
+		}
+	}
+	return nil
+}
+
+// trailerSetter is the shared subset of *fasthttp.RequestHeader and
+// *fasthttp.ResponseHeader used to reapply trailers.
+type trailerSetter interface {
+	AddTrailer(trailer string) error
+	Add(key, value string)
+}
+
+// applyTrailers declares each trailer name and re-adds its value(s). A name
+// fasthttp forbids as a trailer (framing/routing/auth field) is carried as
+// an ordinary header so no data is dropped — lenient by design, since the
+// frame's trailer slot is opaque JSON.
+func applyTrailers(h trailerSetter, raw []byte) error {
+	m, err := decodeHeaderMap(raw)
+	if err != nil {
+		return err
+	}
+	for k, vals := range m {
+		_ = h.AddTrailer(k)
+		for _, v := range vals {
+			h.Add(k, v)
+		}
+	}
+	return nil
 }
 
 func orDefault(s, fallback string) string {
