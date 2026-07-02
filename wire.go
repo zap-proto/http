@@ -88,7 +88,116 @@ import (
 const (
 	FrameRequest  uint16 = 0x01
 	FrameResponse uint16 = 0x02
+	// Streaming response frames. A streamed response is a FrameResponseHead
+	// (status + headers, no body) followed by zero or more FrameData chunks and
+	// a terminating FrameEnd (optional trailers). This is how server→client
+	// push (SSE, MCP notifications, chunked bodies) rides ZAP — the analogue of
+	// HTTP/2 HEADERS + DATA + END_STREAM. The non-streaming FrameResponse path
+	// is unchanged, so existing peers interoperate.
+	FrameResponseHead uint16 = 0x03
+	FrameData         uint16 = 0x04
+	FrameEnd          uint16 = 0x05
 )
+
+// Data/End frame layout: a single bytes slot (the chunk, or the trailer JSON).
+const (
+	chunkBytes    = 0 // bytes (8)
+	chunkSlotSize = 8
+)
+
+// FrameTypeOf peeks a frame's type from its ZAP header without decoding the
+// body, so a reader can dispatch (response vs streamed head vs data vs end).
+func FrameTypeOf(frame []byte) (uint16, error) {
+	msg, err := zap.Parse(frame)
+	if err != nil {
+		return 0, err
+	}
+	return msg.Flags() >> 8, nil
+}
+
+// MarshalResponseHead serializes a response's status + headers (NO body) as the
+// opening frame of a stream. The body is delivered by subsequent FrameData
+// frames.
+func MarshalResponseHead(resp *fasthttp.Response) ([]byte, error) {
+	status := resp.StatusCode()
+	if status == 0 {
+		status = fasthttp.StatusOK
+	}
+	reason := string(resp.Header.StatusMessage())
+	if reason == "" {
+		reason = fasthttp.StatusMessage(status)
+	}
+	proto := string(resp.Header.Protocol())
+	headers, err := encodeHeaderMap(collectResponseHeaders(&resp.Header))
+	if err != nil {
+		return nil, fmt.Errorf("zaphttp: encode headers: %w", err)
+	}
+
+	b := zap.NewBuilder(respSlotSize + len(headers) + len(reason) + len(proto) + 64)
+	ob := b.StartObject(respSlotSize)
+	ob.SetUint16(respStatus, uint16(status))
+	ob.SetText(respReason, reason)
+	ob.SetText(respProto, orDefault(proto, defaultProto))
+	ob.SetBytes(respHeaders, headers)
+	ob.SetBytes(respBody, nil)
+	ob.SetBytes(respTrailer, nil)
+	ob.FinishAsRoot()
+	return b.FinishWithFlags(FrameResponseHead << 8), nil
+}
+
+// UnmarshalResponseHead applies a streamed response's status + headers to dst.
+// The body is left empty; the caller attaches a streaming body that reads the
+// following FrameData frames.
+func UnmarshalResponseHead(frame []byte, dst *fasthttp.Response) error {
+	msg, err := zap.Parse(frame)
+	if err != nil {
+		return err
+	}
+	if t := msg.Flags() >> 8; t != FrameResponseHead {
+		return fmt.Errorf("zaphttp: frame type %#x, want response-head (%#x)", t, FrameResponseHead)
+	}
+	r := msg.Root()
+	dst.Reset()
+	dst.SetStatusCode(int(r.Uint16(respStatus)))
+	if reason := r.Text(respReason); reason != "" {
+		dst.Header.SetStatusMessage([]byte(reason))
+	}
+	if proto := r.Text(respProto); proto != "" {
+		dst.Header.SetProtocol([]byte(proto))
+	}
+	return applyHeadersToResponse(&dst.Header, r.Bytes(respHeaders))
+}
+
+// MarshalData wraps one body chunk as a FrameData frame.
+func MarshalData(chunk []byte) []byte {
+	b := zap.NewBuilder(chunkSlotSize + len(chunk) + 32)
+	ob := b.StartObject(chunkSlotSize)
+	ob.SetBytes(chunkBytes, chunk)
+	ob.FinishAsRoot()
+	return b.FinishWithFlags(FrameData << 8)
+}
+
+// DataChunkOf extracts the chunk bytes from a FrameData frame. The returned
+// slice aliases the frame buffer; copy it to retain past the frame's lifetime.
+func DataChunkOf(frame []byte) ([]byte, error) {
+	msg, err := zap.Parse(frame)
+	if err != nil {
+		return nil, err
+	}
+	if t := msg.Flags() >> 8; t != FrameData {
+		return nil, fmt.Errorf("zaphttp: frame type %#x, want data (%#x)", t, FrameData)
+	}
+	return msg.Root().Bytes(chunkBytes), nil
+}
+
+// MarshalEnd terminates a stream, carrying optional encoded trailers.
+func MarshalEnd(trailer []byte) []byte {
+	b := zap.NewBuilder(chunkSlotSize + len(trailer) + 32)
+	ob := b.StartObject(chunkSlotSize)
+	ob.SetBytes(chunkBytes, trailer)
+	ob.FinishAsRoot()
+	return b.FinishWithFlags(FrameEnd << 8)
+}
 
 // Request frame field offsets within the object's fixed payload. Every
 // text/bytes slot is 8 bytes (relOffset+length); see "Offset discipline"
