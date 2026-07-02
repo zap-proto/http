@@ -21,6 +21,7 @@ package zaphttp
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -103,6 +104,24 @@ func (t *Transport) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
 		conn.Close()
 		return fmt.Errorf("zaphttp: read response: %w", err)
 	}
+	ft, err := FrameTypeOf(respFrame)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("zaphttp: response frame: %w", err)
+	}
+
+	// Streamed response: apply the head, then attach a body stream that reads
+	// FrameData chunks until FrameEnd. The conn is NOT pooled until the stream
+	// is fully consumed (or the body is closed) — the reader owns it.
+	if ft == FrameResponseHead {
+		if err := UnmarshalResponseHead(respFrame, resp); err != nil {
+			conn.Close()
+			return fmt.Errorf("zaphttp: unmarshal response head: %w", err)
+		}
+		resp.SetBodyStream(&streamReader{t: t, pc: pc, br: br}, -1)
+		return nil
+	}
+
 	if err := UnmarshalResponse(respFrame, resp); err != nil {
 		conn.Close()
 		return fmt.Errorf("zaphttp: unmarshal response: %w", err)
@@ -113,6 +132,84 @@ func (t *Transport) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
 	_ = conn.SetReadDeadline(time.Time{})
 	t.releaseConn(pc)
 	return nil
+}
+
+// streamReader turns the FrameData/FrameEnd sequence following a streamed
+// response head into an io.ReadCloser body: each Read drains the current chunk,
+// pulling the next FrameData frame when empty and returning io.EOF at FrameEnd.
+// fasthttp closes it when the response is released, which returns the conn to
+// the pool (fully drained) or closes it (abandoned mid-stream).
+type streamReader struct {
+	t    *Transport
+	pc   *pooledConn
+	br   *bufio.Reader
+	rest []byte // undrained tail of the current chunk
+	done bool
+	err  error
+}
+
+func (s *streamReader) Read(p []byte) (int, error) {
+	if len(s.rest) > 0 {
+		n := copy(p, s.rest)
+		s.rest = s.rest[n:]
+		return n, nil
+	}
+	if s.done {
+		return 0, io.EOF
+	}
+	if s.err != nil {
+		return 0, s.err
+	}
+	frame, err := readFrame(s.br)
+	if err != nil {
+		s.err = err
+		return 0, err
+	}
+	ft, err := FrameTypeOf(frame)
+	if err != nil {
+		s.err = err
+		return 0, err
+	}
+	switch ft {
+	case FrameData:
+		chunk, err := DataChunkOf(frame)
+		if err != nil {
+			s.err = err
+			return 0, err
+		}
+		n := copy(p, chunk)
+		if n < len(chunk) {
+			s.rest = append(s.rest, chunk[n:]...) // buffer the tail (chunk aliases frame; copy)
+		}
+		return n, nil
+	case FrameEnd:
+		s.done = true
+		s.release()
+		return 0, io.EOF
+	default:
+		s.err = fmt.Errorf("zaphttp: unexpected frame %#x mid-stream", ft)
+		return 0, s.err
+	}
+}
+
+// Close returns the conn to the pool if the stream drained cleanly, else closes
+// it (abandoned mid-stream leaves unread frames on the wire — not reusable).
+func (s *streamReader) Close() error {
+	if s.done {
+		s.release()
+	} else {
+		s.pc.c.Close()
+	}
+	return nil
+}
+
+func (s *streamReader) release() {
+	if s.pc == nil {
+		return
+	}
+	_ = s.pc.c.SetReadDeadline(time.Time{})
+	s.t.releaseConn(s.pc)
+	s.pc = nil
 }
 
 // acquireConn pops an idle conn or dials a new one.

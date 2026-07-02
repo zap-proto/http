@@ -27,9 +27,9 @@ import (
 // Server is a ZAP-HTTP server. Zero-value is usable; common knobs (Addr,
 // Handler, ReadTimeout, …) mirror fasthttp.Server.
 type Server struct {
-	Addr         string                    // ":9999" if empty
-	Handler      fasthttp.RequestHandler   // required
-	ReadTimeout  time.Duration             // 0 means no timeout
+	Addr         string                  // ":9999" if empty
+	Handler      fasthttp.RequestHandler // required
+	ReadTimeout  time.Duration           // 0 means no timeout
 	WriteTimeout time.Duration
 	IdleTimeout  time.Duration
 	Logger       fasthttp.Logger // passed to each RequestCtx; nil is fine
@@ -135,13 +135,28 @@ func (s *Server) serveConn(conn net.Conn) {
 			s.Handler(ctx)
 		}()
 
+		if s.WriteTimeout > 0 {
+			_ = conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
+		}
+
+		// A streamed body (SSE, MCP notifications, chunked) is delivered as a
+		// head frame + N data frames + an end frame, so the client sees each
+		// chunk as the handler flushes it — real server→client push over ZAP.
+		// A normal body takes the single-frame path (unchanged).
+		if ctx.Response.IsBodyStream() {
+			if err := s.streamResponse(conn, &ctx.Response); err != nil {
+				if !isClosedConn(err) {
+					log.Printf("zaphttp: stream response: %v", err)
+				}
+				return
+			}
+			continue
+		}
+
 		respBytes, err := MarshalResponse(&ctx.Response)
 		if err != nil {
 			log.Printf("zaphttp: marshal response: %v", err)
 			return
-		}
-		if s.WriteTimeout > 0 {
-			_ = conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
 		}
 		if err := writeFrame(conn, respBytes); err != nil {
 			if !isClosedConn(err) {
@@ -150,6 +165,51 @@ func (s *Server) serveConn(conn net.Conn) {
 			return
 		}
 	}
+}
+
+// streamResponse writes a streamed response: the head (status + headers), then
+// one data frame per flush of the body stream, then an end frame. BodyWriteTo
+// runs the fasthttp body-stream writer against chunkWriter, so each handler
+// flush becomes a frame on the wire immediately (no full buffering).
+func (s *Server) streamResponse(conn net.Conn, resp *fasthttp.Response) error {
+	head, err := MarshalResponseHead(resp)
+	if err != nil {
+		return err
+	}
+	if err := writeFrame(conn, head); err != nil {
+		return err
+	}
+	cw := &chunkWriter{w: conn}
+	if err := resp.BodyWriteTo(cw); err != nil {
+		return err
+	}
+	if cw.err != nil {
+		return cw.err
+	}
+	return writeFrame(conn, MarshalEnd(nil))
+}
+
+// chunkWriter turns each Write (one flush of the body stream) into a FrameData
+// frame. The bytes are copied because fasthttp may reuse the buffer.
+type chunkWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (c *chunkWriter) Write(p []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	chunk := make([]byte, len(p))
+	copy(chunk, p)
+	if err := writeFrame(c.w, MarshalData(chunk)); err != nil {
+		c.err = err
+		return 0, err
+	}
+	return len(p), nil
 }
 
 func (s *Server) writeError(w io.Writer, status int, msg string) {
