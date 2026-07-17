@@ -25,26 +25,66 @@ import (
 // malicious peer announcing a multi-gigabyte length prefix.
 const MaxFrameSize = 64 << 20 // 64 MiB
 
-// readFrame reads one length-prefixed frame from r. The returned
-// byte slice is owned by the caller; nil + io.EOF indicates the peer
-// closed cleanly between frames.
+// readFrame reads one length-prefixed frame from r into a freshly allocated
+// slice. nil + io.EOF indicates the peer closed cleanly between frames. Hot
+// paths use readFrameInto to reuse a buffer instead.
 func readFrame(r *bufio.Reader) ([]byte, error) {
-	var hdr [4]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
+	return readFrameInto(r, nil)
+}
+
+// readFrameInto reads one length-prefixed frame into buf, growing it only when
+// the frame exceeds its capacity, and returns the frame slice (buf reused). The
+// caller reassigns its buffer from the return value so a grown buffer persists
+// across calls — the steady-state read is allocation-free. The frame's bytes
+// are consumed synchronously by Unmarshal{Request,Response} (which copy into the
+// fasthttp store), so the buffer is free to reuse on the next call.
+func readFrameInto(r *bufio.Reader, buf []byte) ([]byte, error) {
+	// Peek the length prefix out of the bufio buffer directly rather than
+	// io.ReadFull into a local [4]byte: passing a stack array through the
+	// io.Reader interface forces it to the heap on every call. Peek returns a
+	// view into the reader's own buffer — no copy, no escape.
+	hdr, err := r.Peek(4)
+	if err != nil {
+		return buf, err
 	}
-	n := binary.BigEndian.Uint32(hdr[:])
+	n := binary.BigEndian.Uint32(hdr)
+	if _, err := r.Discard(4); err != nil {
+		return buf, err
+	}
 	if n == 0 {
-		return nil, fmt.Errorf("zaphttp: zero-length frame")
+		return buf, fmt.Errorf("zaphttp: zero-length frame")
 	}
 	if n > MaxFrameSize {
-		return nil, fmt.Errorf("zaphttp: frame size %d exceeds MaxFrameSize=%d", n, MaxFrameSize)
+		return buf, fmt.Errorf("zaphttp: frame size %d exceeds MaxFrameSize=%d", n, MaxFrameSize)
 	}
-	buf := make([]byte, n)
+	if uint32(cap(buf)) < n {
+		buf = make([]byte, n)
+	} else {
+		buf = buf[:n]
+	}
+	// buf is already heap-backed (persistent across calls), so ReadFull's
+	// interface indirection costs no new allocation here.
 	if _, err := io.ReadFull(r, buf); err != nil {
-		return nil, fmt.Errorf("zaphttp: short frame: %w", err)
+		return buf, fmt.Errorf("zaphttp: short frame: %w", err)
 	}
 	return buf, nil
+}
+
+// writeFramePrefixed writes a length prefix + frame in ONE Write. The frame
+// buffer must have been built with 4 leading bytes reserved for the prefix
+// (frame[:4] is the placeholder); this halves the per-message syscall count vs
+// writeFrame's separate header+body writes.
+func writeFramePrefixed(w io.Writer, framePlusPrefix []byte) error {
+	body := len(framePlusPrefix) - 4
+	if body <= 0 {
+		return fmt.Errorf("zaphttp: refusing to write zero-length frame")
+	}
+	if uint64(body) > MaxFrameSize {
+		return fmt.Errorf("zaphttp: frame size %d exceeds MaxFrameSize=%d", body, MaxFrameSize)
+	}
+	binary.BigEndian.PutUint32(framePlusPrefix[0:4], uint32(body))
+	_, err := w.Write(framePlusPrefix)
+	return err
 }
 
 // writeFrame writes one length-prefixed frame to w.

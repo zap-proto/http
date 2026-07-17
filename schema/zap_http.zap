@@ -3,15 +3,20 @@
 # Authored in ZAP schema language (whitespace-significant, no curly braces,
 # field ordinals inferred from declaration order).
 #
-# This is the source of truth for the ZAP-HTTP wire format. The
-# generated Go bindings in ../internal/wire are produced via:
+# This is the source of truth for the ZAP-HTTP wire format. The Go
+# codec is hand-written against the github.com/zap-proto/go runtime in
+# ../wire.go — each struct below maps to a zap-proto/go object whose
+# fields are packed at fixed 8-byte-aligned slots (text/bytes) or
+# natural-width scalar offsets. The field offsets in ../wire.go are the
+# binding; this file documents the logical shape they implement.
 #
-#     zapc compile zap_http.zap --out=zap_http.capnp
-#     capnp compile -ogo:../internal/wire zap_http.capnp
-#
-# The wire is one ZAP frame per HTTP message. A request frame carries
-# the request line + headers + body; a response frame carries status +
-# headers + body. Both sides may carry trailers (RFC 9110 §6.5).
+# The wire is one ZAP frame per HTTP message. The frame type (request
+# vs response) rides in the message header flags (flags>>8), not a
+# union struct. A request frame carries the request line + headers +
+# body; a response frame carries status + headers + body. Both sides
+# may carry trailers (RFC 9110 §6.5). Headers and trailers are encoded
+# as a JSON map<Text, List(Text)> rather than a nested struct list,
+# matching http.Header's native shape losslessly.
 #
 # Streaming (chunked-style transfer) is reserved for a follow-up
 # protocol slice and not represented here. v0.1 assumes the entire body
@@ -50,9 +55,9 @@ struct Response
   body    Data
   trailer List(Header)
 
-# Frame is the union the wire actually carries. Some sub-protocols may
-# add Notify or Stream variants in future; today there are exactly two.
-struct Frame
-  union
-    request  Request
-    response Response
+# Frame discrimination is carried by the ZAP message header flags
+# (flags>>8), not a union struct: FrameRequest=0x01 tags a Request,
+# FrameResponse=0x02 tags a Response (see ../wire.go). A Request object
+# is the message root when the flag is FrameRequest; a Response object
+# is the root when it is FrameResponse. Some sub-protocols may add
+# Notify or Stream type IDs in future; today there are exactly two.

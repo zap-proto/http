@@ -1,56 +1,52 @@
-// Server — net/http.Handler-compatible server speaking ZAP-HTTP.
+// Server — a fasthttp.RequestHandler served over ZAP-HTTP.
 //
-// Existing handlers work unchanged:
+// A Fiber app (or any fasthttp stack) hands its handler straight in:
 //
-//   mux := http.NewServeMux()
-//   mux.HandleFunc("/healthz", okHandler)
-//   zaphttp.ListenAndServe(":9999", mux)
+//	srv := &zaphttp.Server{Addr: ":9999", Handler: app.Handler()}
+//	srv.ListenAndServe()
 //
 // The server reads ZAP-HTTP frames off each accepted connection,
-// reconstructs *http.Request, dispatches to the handler, captures the
-// handler's response via a buffering ResponseWriter, and writes one
-// response frame back. Connections are kept alive across requests.
+// reconstructs a *fasthttp.RequestCtx, dispatches to the handler, and
+// writes one response frame back from the ctx's Response. Connections are
+// kept alive across requests. There is no net/http anywhere in the path.
 
 package zaphttp
 
 import (
 	"bufio"
-	"bytes"
-	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
-	"strconv"
 	"sync"
 	"time"
+
+	"github.com/valyala/fasthttp"
 )
 
-// Server is a ZAP-HTTP server. Zero-value is usable; common knobs
-// (Addr, Handler, ReadTimeout, …) mirror net/http.Server.
+// Server is a ZAP-HTTP server. Zero-value is usable; common knobs (Addr,
+// Handler, ReadTimeout, …) mirror fasthttp.Server.
 type Server struct {
-	Addr           string        // ":9999" if empty
-	Handler        http.Handler  // http.DefaultServeMux if nil
-	ReadTimeout    time.Duration // 0 means no timeout
-	WriteTimeout   time.Duration
-	IdleTimeout    time.Duration
-	MaxHeaderBytes int           // not enforced today; placeholder for parity
+	Addr         string                  // ":9999" if empty
+	Handler      fasthttp.RequestHandler // required
+	ReadTimeout  time.Duration           // 0 means no timeout
+	WriteTimeout time.Duration
+	IdleTimeout  time.Duration
+	Logger       fasthttp.Logger // passed to each RequestCtx; nil is fine
 
 	mu       sync.Mutex
 	listener net.Listener
 	closed   bool
 }
 
-// ListenAndServe is the convenience equivalent of net/http.ListenAndServe.
-func ListenAndServe(addr string, handler http.Handler) error {
+// ListenAndServe is the convenience equivalent of fasthttp.ListenAndServe.
+func ListenAndServe(addr string, handler fasthttp.RequestHandler) error {
 	s := &Server{Addr: addr, Handler: handler}
 	return s.ListenAndServe()
 }
 
-// ListenAndServe binds Addr and serves until Close is called or a
-// fatal accept error occurs.
+// ListenAndServe binds Addr and serves until Close is called or a fatal
+// accept error occurs.
 func (s *Server) ListenAndServe() error {
 	addr := s.Addr
 	if addr == "" {
@@ -70,9 +66,8 @@ func (s *Server) Serve(ln net.Listener) error {
 	s.listener = ln
 	s.mu.Unlock()
 
-	handler := s.Handler
-	if handler == nil {
-		handler = http.DefaultServeMux
+	if s.Handler == nil {
+		return errors.New("zaphttp: Server.Handler is nil")
 	}
 
 	for {
@@ -90,19 +85,34 @@ func (s *Server) Serve(ln net.Listener) error {
 			}
 			return err
 		}
-		go s.serveConn(conn, handler)
+		go s.serveConn(conn)
 	}
 }
 
-func (s *Server) serveConn(conn net.Conn, handler http.Handler) {
+func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
-	br := bufio.NewReader(conn)
+	br := bufio.NewReaderSize(conn, connReadBufSize)
+
+	// One RequestCtx for the whole connection. fasthttp's own HTTP server pools
+	// RequestCtx across requests; the previous ZAP server heap-allocated one per
+	// request (plus a fasthttp.Request), which dominated its GC pressure. Init2
+	// binds the real conn (so RemoteAddr resolves) and keeps body buffers
+	// attached for reuse; Request and Response are reset per request below.
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Init2(conn, s.Logger, false)
+
+	// Per-connection scratch buffers: the inbound frame is decoded straight into
+	// ctx.Request (which copies out what it keeps), and the response frame is
+	// built here. Both grow once and are reused, so steady-state serving is
+	// allocation-free.
+	var readBuf, writeBuf []byte
 
 	for {
 		if s.IdleTimeout > 0 {
 			_ = conn.SetReadDeadline(time.Now().Add(s.IdleTimeout))
 		}
-		raw, err := readFrame(br)
+		var err error
+		readBuf, err = readFrameInto(br, readBuf)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !isClosedConn(err) {
 				log.Printf("zaphttp: read frame: %v", err)
@@ -112,61 +122,58 @@ func (s *Server) serveConn(conn net.Conn, handler http.Handler) {
 		if s.ReadTimeout > 0 {
 			_ = conn.SetReadDeadline(time.Now().Add(s.ReadTimeout))
 		}
-		req, err := UnmarshalRequest(raw)
-		if err != nil {
-			s.writeError(conn, http.StatusBadRequest, "malformed request frame: "+err.Error())
+
+		// Decode into the connection's RequestCtx (UnmarshalRequest resets it
+		// first), then clear the previous request's response and user values —
+		// the reset fasthttp.Init would have done for a fresh ctx.
+		if err := UnmarshalRequest(readBuf, &ctx.Request); err != nil {
+			s.writeError(conn, fasthttp.StatusBadRequest, "malformed request frame: "+err.Error())
 			return
 		}
-		req.RemoteAddr = conn.RemoteAddr().String()
+		ctx.Response.Reset()
+		ctx.ResetUserValues()
 
-		// Wire a buffering ResponseWriter. The handler runs to
-		// completion and we then marshal the captured state into a
-		// single response frame. v0.2 will swap this for a streaming
-		// writer once the transport supports it.
-		rw := &bufferingResponseWriter{
-			header: make(http.Header),
-			body:   &bytes.Buffer{},
-		}
-		ctx := context.Background()
-		req = req.WithContext(ctx)
-
-		// Defer-recover so a handler panic returns 500 rather than
-		// dropping the connection silently.
+		// Defer-recover so a handler panic returns 500 rather than dropping
+		// the connection silently.
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					if !rw.wroteHeader {
-						rw.WriteHeader(http.StatusInternalServerError)
-					}
-					log.Printf("zaphttp: handler panic on %s %s: %v", req.Method, req.URL.RequestURI(), r)
+					ctx.Response.Reset()
+					ctx.Response.SetStatusCode(fasthttp.StatusInternalServerError)
+					log.Printf("zaphttp: handler panic on %s %s: %v",
+						ctx.Method(), ctx.RequestURI(), r)
 				}
 			}()
-			handler.ServeHTTP(rw, req)
+			s.Handler(ctx)
 		}()
 
-		if !rw.wroteHeader {
-			rw.WriteHeader(http.StatusOK)
-		}
-		// Auto-fill Content-Length when the handler hasn't.
-		if rw.header.Get("Content-Length") == "" {
-			rw.header.Set("Content-Length", strconv.Itoa(rw.body.Len()))
+		if s.WriteTimeout > 0 {
+			_ = conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
 		}
 
-		resp := &http.Response{
-			StatusCode: rw.status,
-			Status:     fmt.Sprintf("%d %s", rw.status, http.StatusText(rw.status)),
-			Header:     rw.header,
-			Body:       io.NopCloser(rw.body),
+		// A streamed body (SSE, MCP notifications, chunked) is delivered as a
+		// head frame + N data frames + an end frame, so the client sees each
+		// chunk as the handler flushes it — real server→client push over ZAP.
+		// A normal body takes the single-frame path.
+		if ctx.Response.IsBodyStream() {
+			if err := s.streamResponse(conn, &ctx.Response); err != nil {
+				if !isClosedConn(err) {
+					log.Printf("zaphttp: stream response: %v", err)
+				}
+				return
+			}
+			continue
 		}
-		respBytes, err := MarshalResponse(resp)
+
+		// Build [4-byte length prefix][response frame] in one buffer and write
+		// it with a single syscall.
+		writeBuf = append(writeBuf[:0], 0, 0, 0, 0)
+		writeBuf, err = AppendResponse(writeBuf, &ctx.Response)
 		if err != nil {
 			log.Printf("zaphttp: marshal response: %v", err)
 			return
 		}
-		if s.WriteTimeout > 0 {
-			_ = conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
-		}
-		if err := writeFrame(conn, respBytes); err != nil {
+		if err := writeFramePrefixed(conn, writeBuf); err != nil {
 			if !isClosedConn(err) {
 				log.Printf("zaphttp: write frame: %v", err)
 			}
@@ -175,14 +182,61 @@ func (s *Server) serveConn(conn net.Conn, handler http.Handler) {
 	}
 }
 
-func (s *Server) writeError(w io.Writer, status int, msg string) {
-	resp := &http.Response{
-		StatusCode: status,
-		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
-		Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
-		Body:       io.NopCloser(bytes.NewBufferString(msg)),
+// connReadBufSize is the per-connection bufio read buffer. Larger than bufio's
+// 4 KiB default so back-to-back small frames drain with fewer read syscalls.
+const connReadBufSize = 16 << 10
+
+// streamResponse writes a streamed response: the head (status + headers), then
+// one data frame per flush of the body stream, then an end frame. BodyWriteTo
+// runs the fasthttp body-stream writer against chunkWriter, so each handler
+// flush becomes a frame on the wire immediately (no full buffering).
+func (s *Server) streamResponse(conn net.Conn, resp *fasthttp.Response) error {
+	head, err := MarshalResponseHead(resp)
+	if err != nil {
+		return err
 	}
-	frame, err := MarshalResponse(resp)
+	if err := writeFrame(conn, head); err != nil {
+		return err
+	}
+	cw := &chunkWriter{w: conn}
+	if err := resp.BodyWriteTo(cw); err != nil {
+		return err
+	}
+	if cw.err != nil {
+		return cw.err
+	}
+	return writeFrame(conn, MarshalEnd(nil))
+}
+
+// chunkWriter turns each Write (one flush of the body stream) into a FrameData
+// frame. The bytes are copied because fasthttp may reuse the buffer.
+type chunkWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (c *chunkWriter) Write(p []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	chunk := make([]byte, len(p))
+	copy(chunk, p)
+	if err := writeFrame(c.w, MarshalData(chunk)); err != nil {
+		c.err = err
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (s *Server) writeError(w io.Writer, status int, msg string) {
+	var resp fasthttp.Response
+	resp.SetStatusCode(status)
+	resp.Header.SetContentType("text/plain; charset=utf-8")
+	resp.SetBodyString(msg)
+	frame, err := MarshalResponse(&resp)
 	if err != nil {
 		return
 	}
@@ -198,32 +252,6 @@ func (s *Server) Close() error {
 		return nil
 	}
 	return s.listener.Close()
-}
-
-// ---- bufferingResponseWriter ----
-
-type bufferingResponseWriter struct {
-	header      http.Header
-	body        *bytes.Buffer
-	status      int
-	wroteHeader bool
-}
-
-func (w *bufferingResponseWriter) Header() http.Header { return w.header }
-
-func (w *bufferingResponseWriter) Write(b []byte) (int, error) {
-	if !w.wroteHeader {
-		w.WriteHeader(http.StatusOK)
-	}
-	return w.body.Write(b)
-}
-
-func (w *bufferingResponseWriter) WriteHeader(status int) {
-	if w.wroteHeader {
-		return
-	}
-	w.status = status
-	w.wroteHeader = true
 }
 
 func isClosedConn(err error) bool {
