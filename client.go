@@ -29,11 +29,14 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// pooledConn is one idle connection. The bufio.Reader is held with the
-// conn so the read side amortizes its own buffer alloc across requests.
+// pooledConn is one idle connection. The bufio.Reader and the request/response
+// scratch buffers are held with the conn so a warm connection marshals, writes,
+// reads, and decodes with zero heap allocation across requests.
 type pooledConn struct {
-	c  net.Conn
-	br *bufio.Reader
+	c    net.Conn
+	br   *bufio.Reader
+	wbuf []byte // request frame, incl. 4-byte length prefix
+	rbuf []byte // inbound response frame
 }
 
 // Transport speaks ZAP-HTTP over a pooled TCP connection. Field-zero is
@@ -86,12 +89,15 @@ func (t *Transport) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
 	}
 	conn, br := pc.c, pc.br
 
-	frame, err := MarshalRequest(req)
+	// Build [4-byte length prefix][request frame] in the conn's reused buffer and
+	// write it with a single syscall.
+	pc.wbuf = append(pc.wbuf[:0], 0, 0, 0, 0)
+	pc.wbuf, err = AppendRequest(pc.wbuf, req)
 	if err != nil {
 		conn.Close()
 		return err
 	}
-	if err := writeFrame(conn, frame); err != nil {
+	if err := writeFramePrefixed(conn, pc.wbuf); err != nil {
 		conn.Close()
 		return fmt.Errorf("zaphttp: write request: %w", err)
 	}
@@ -99,20 +105,23 @@ func (t *Transport) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
 	if t.readTimeout > 0 {
 		_ = conn.SetReadDeadline(time.Now().Add(t.readTimeout))
 	}
-	respFrame, err := readFrame(br)
+	pc.rbuf, err = readFrameInto(br, pc.rbuf)
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("zaphttp: read response: %w", err)
 	}
-	ft, err := FrameTypeOf(respFrame)
-	if err != nil {
+	respFrame := pc.rbuf
+	ft, ok := frameType(respFrame)
+	if !ok {
 		conn.Close()
-		return fmt.Errorf("zaphttp: response frame: %w", err)
+		return fmt.Errorf("zaphttp: short response frame")
 	}
 
 	// Streamed response: apply the head, then attach a body stream that reads
 	// FrameData chunks until FrameEnd. The conn is NOT pooled until the stream
-	// is fully consumed (or the body is closed) — the reader owns it.
+	// is fully consumed (or the body is closed) — the reader owns it. The head
+	// frame must be copied out of the conn's reused rbuf, since the streamReader
+	// keeps reading into it.
 	if ft == FrameResponseHead {
 		if err := UnmarshalResponseHead(respFrame, resp); err != nil {
 			conn.Close()
@@ -232,7 +241,7 @@ func (t *Transport) acquireConn() (*pooledConn, error) {
 		_ = tc.SetKeepAlivePeriod(30 * time.Second)
 		_ = tc.SetNoDelay(true)
 	}
-	return &pooledConn{c: c, br: bufio.NewReader(c)}, nil
+	return &pooledConn{c: c, br: bufio.NewReaderSize(c, connReadBufSize)}, nil
 }
 
 // releaseConn returns a conn to the pool, or closes it if the pool is full.
