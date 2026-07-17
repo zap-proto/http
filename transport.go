@@ -39,11 +39,18 @@ func readFrame(r *bufio.Reader) ([]byte, error) {
 // are consumed synchronously by Unmarshal{Request,Response} (which copy into the
 // fasthttp store), so the buffer is free to reuse on the next call.
 func readFrameInto(r *bufio.Reader, buf []byte) ([]byte, error) {
-	var hdr [4]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+	// Peek the length prefix out of the bufio buffer directly rather than
+	// io.ReadFull into a local [4]byte: passing a stack array through the
+	// io.Reader interface forces it to the heap on every call. Peek returns a
+	// view into the reader's own buffer — no copy, no escape.
+	hdr, err := r.Peek(4)
+	if err != nil {
 		return buf, err
 	}
-	n := binary.BigEndian.Uint32(hdr[:])
+	n := binary.BigEndian.Uint32(hdr)
+	if _, err := r.Discard(4); err != nil {
+		return buf, err
+	}
 	if n == 0 {
 		return buf, fmt.Errorf("zaphttp: zero-length frame")
 	}
@@ -55,6 +62,8 @@ func readFrameInto(r *bufio.Reader, buf []byte) ([]byte, error) {
 	} else {
 		buf = buf[:n]
 	}
+	// buf is already heap-backed (persistent across calls), so ReadFull's
+	// interface indirection costs no new allocation here.
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return buf, fmt.Errorf("zaphttp: short frame: %w", err)
 	}
