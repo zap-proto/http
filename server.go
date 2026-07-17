@@ -91,14 +91,28 @@ func (s *Server) Serve(ln net.Listener) error {
 
 func (s *Server) serveConn(conn net.Conn) {
 	defer conn.Close()
-	br := bufio.NewReader(conn)
-	remoteAddr := conn.RemoteAddr()
+	br := bufio.NewReaderSize(conn, connReadBufSize)
+
+	// One RequestCtx for the whole connection. fasthttp's own HTTP server pools
+	// RequestCtx across requests; the previous ZAP server heap-allocated one per
+	// request (plus a fasthttp.Request), which dominated its GC pressure. Init2
+	// binds the real conn (so RemoteAddr resolves) and keeps body buffers
+	// attached for reuse; Request and Response are reset per request below.
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Init2(conn, s.Logger, false)
+
+	// Per-connection scratch buffers: the inbound frame is decoded straight into
+	// ctx.Request (which copies out what it keeps), and the response frame is
+	// built here. Both grow once and are reused, so steady-state serving is
+	// allocation-free.
+	var readBuf, writeBuf []byte
 
 	for {
 		if s.IdleTimeout > 0 {
 			_ = conn.SetReadDeadline(time.Now().Add(s.IdleTimeout))
 		}
-		raw, err := readFrame(br)
+		var err error
+		readBuf, err = readFrameInto(br, readBuf)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !isClosedConn(err) {
 				log.Printf("zaphttp: read frame: %v", err)
@@ -109,17 +123,15 @@ func (s *Server) serveConn(conn net.Conn) {
 			_ = conn.SetReadDeadline(time.Now().Add(s.ReadTimeout))
 		}
 
-		var req fasthttp.Request
-		if err := UnmarshalRequest(raw, &req); err != nil {
+		// Decode into the connection's RequestCtx (UnmarshalRequest resets it
+		// first), then clear the previous request's response and user values —
+		// the reset fasthttp.Init would have done for a fresh ctx.
+		if err := UnmarshalRequest(readBuf, &ctx.Request); err != nil {
 			s.writeError(conn, fasthttp.StatusBadRequest, "malformed request frame: "+err.Error())
 			return
 		}
-
-		// Fresh ctx per request: fasthttp's Init resets connection state and
-		// copies the request in, but does not reset a reused Response, so a
-		// zero-value ctx is the clean, correct choice.
-		ctx := &fasthttp.RequestCtx{}
-		ctx.Init(&req, remoteAddr, s.Logger)
+		ctx.Response.Reset()
+		ctx.ResetUserValues()
 
 		// Defer-recover so a handler panic returns 500 rather than dropping
 		// the connection silently.
@@ -142,7 +154,7 @@ func (s *Server) serveConn(conn net.Conn) {
 		// A streamed body (SSE, MCP notifications, chunked) is delivered as a
 		// head frame + N data frames + an end frame, so the client sees each
 		// chunk as the handler flushes it — real server→client push over ZAP.
-		// A normal body takes the single-frame path (unchanged).
+		// A normal body takes the single-frame path.
 		if ctx.Response.IsBodyStream() {
 			if err := s.streamResponse(conn, &ctx.Response); err != nil {
 				if !isClosedConn(err) {
@@ -153,12 +165,15 @@ func (s *Server) serveConn(conn net.Conn) {
 			continue
 		}
 
-		respBytes, err := MarshalResponse(&ctx.Response)
+		// Build [4-byte length prefix][response frame] in one buffer and write
+		// it with a single syscall.
+		writeBuf = append(writeBuf[:0], 0, 0, 0, 0)
+		writeBuf, err = AppendResponse(writeBuf, &ctx.Response)
 		if err != nil {
 			log.Printf("zaphttp: marshal response: %v", err)
 			return
 		}
-		if err := writeFrame(conn, respBytes); err != nil {
+		if err := writeFramePrefixed(conn, writeBuf); err != nil {
 			if !isClosedConn(err) {
 				log.Printf("zaphttp: write frame: %v", err)
 			}
@@ -166,6 +181,10 @@ func (s *Server) serveConn(conn net.Conn) {
 		}
 	}
 }
+
+// connReadBufSize is the per-connection bufio read buffer. Larger than bufio's
+// 4 KiB default so back-to-back small frames drain with fewer read syscalls.
+const connReadBufSize = 16 << 10
 
 // streamResponse writes a streamed response: the head (status + headers), then
 // one data frame per flush of the body stream, then an end frame. BodyWriteTo
