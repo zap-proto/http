@@ -7,17 +7,15 @@
 //
 //   - no *zap.Builder / *zap.ObjectBuilder per marshal, no per-field double
 //     copy (Builder.SetBytes did []byte(v) then append([]byte(nil), v...));
-//   - no map[string][]string + json.Marshal for the headers slot — headers are
-//     streamed straight into the frame's variable tail as compact, sorted-key
-//     JSON, byte-identical to json.Marshal(map[string][]string);
-//   - no *zap.Message per parse and no map + json.Unmarshal on decode — the
-//     headers JSON is scanned in place and applied straight to the fasthttp
-//     header store.
+//   - no map[string][]string and no JSON for the headers slot — headers stream
+//     straight into the frame's variable tail as length-prefixed pairs;
+//   - no *zap.Message per parse and no map on decode — each name and value is a
+//     subslice of the frame, applied straight to the fasthttp header store.
 //
 // Callers append into a reusable buffer (Append{Request,Response}), so after a
 // connection warms up the steady-state cost is zero heap allocation.
 //
-// # Wire layout (must stay byte-identical — see schema/zap_http.zap)
+// # Wire layout (see schema/zap_http.zap)
 //
 // A frame is one zap-proto/go message: a 16-byte header (magic "ZAP\x00",
 // version=1, flags, rootOffset=16, size) followed by the root object. The root
@@ -30,11 +28,9 @@
 package zaphttp
 
 import (
-	"bytes"
 	"encoding/binary"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"slices"
 	"sync"
 	"unsafe"
 
@@ -120,7 +116,7 @@ func AppendRequest(dst []byte, req *fasthttp.Request) ([]byte, error) {
 
 	hStart := len(dst)
 	skip := newTrailerSkip(&req.Header)
-	dst = appendRequestHeadersJSON(dst, &req.Header, skip)
+	dst = appendHeaders(dst, &req.Header, skip)
 	dst = patchVarSlot(dst, obj+reqHeaders, hStart)
 
 	dst = putVarBytes(dst, obj+reqBody, req.Body())
@@ -164,7 +160,7 @@ func AppendResponse(dst []byte, resp *fasthttp.Response) ([]byte, error) {
 
 	hStart := len(dst)
 	skip := newTrailerSkip(&resp.Header)
-	dst = appendResponseHeadersJSON(dst, &resp.Header, skip)
+	dst = appendHeaders(dst, &resp.Header, skip)
 	dst = patchVarSlot(dst, obj+respHeaders, hStart)
 
 	dst = putVarBytes(dst, obj+respBody, resp.Body())
@@ -249,7 +245,7 @@ func readU16(frame []byte, size, root, fieldOff int) uint16 {
 	return binary.LittleEndian.Uint16(frame[pos:])
 }
 
-// ---- header JSON encode (zero-alloc, byte-identical to json.Marshal) ----
+// ---- header encode ----
 
 // hpair is one header name/value, both aliasing fasthttp's store; valid only
 // for the duration of a single marshal call.
@@ -285,11 +281,28 @@ func (s *trailerSkip) has(key []byte) bool {
 	return false
 }
 
-// appendRequestHeadersJSON and appendResponseHeadersJSON collect, sort, and emit
-// a request's / response's headers as compact JSON. Two concrete functions (not
-// one over an interface) so escape analysis can prove the VisitAll closure does
-// not leak and keep it — and the collected pairs — off the heap.
-func appendRequestHeadersJSON(dst []byte, h *fasthttp.RequestHeader, skip *trailerSkip) []byte {
+// ---- headers ----
+//
+// Headers travel as a count-prefixed run of length-prefixed name/value pairs:
+//
+//	[u32 count]   then count times:   [u32 nameLen][name][u32 valueLen][value]
+//
+// Reading one is a walk over the frame's own bytes — every name and value is a
+// subslice, so a decode allocates nothing. Repeated names are simply repeated
+// pairs, which is what VisitAll already yields for a multi-value header, so
+// nothing has to model a list. Order is preserved as sent, and there is no
+// escaping, no sort, and no grammar for two implementations to disagree about.
+
+// headerVisitor is the shared shape of *fasthttp.RequestHeader and
+// *fasthttp.ResponseHeader. Generic rather than an interface parameter so each
+// instantiation keeps its VisitAll closure off the heap.
+type headerVisitor interface {
+	VisitAll(f func(key, value []byte))
+}
+
+// appendHeaders writes h's headers to dst, skipping the frame-owned ones and
+// any name declared as a trailer.
+func appendHeaders[H headerVisitor](dst []byte, h H, skip *trailerSkip) []byte {
 	c := hcollectorPool.Get().(*hcollector)
 	c.pairs = c.pairs[:0]
 	h.VisitAll(func(key, value []byte) {
@@ -298,180 +311,66 @@ func appendRequestHeadersJSON(dst []byte, h *fasthttp.RequestHeader, skip *trail
 		}
 		c.pairs = append(c.pairs, hpair{key, value})
 	})
-	dst = emitHeadersJSON(dst, c.pairs)
+	dst = emitHeaders(dst, c.pairs)
 	hcollectorPool.Put(c)
 	return dst
 }
 
-func appendResponseHeadersJSON(dst []byte, h *fasthttp.ResponseHeader, skip *trailerSkip) []byte {
-	c := hcollectorPool.Get().(*hcollector)
-	c.pairs = c.pairs[:0]
-	h.VisitAll(func(key, value []byte) {
-		if isFrameOwnedHeaderBytes(key) || skip.has(key) {
-			return
-		}
-		c.pairs = append(c.pairs, hpair{key, value})
-	})
-	dst = emitHeadersJSON(dst, c.pairs)
-	hcollectorPool.Put(c)
-	return dst
-}
-
-// emitHeadersJSON writes pairs as {"k":["v",...],...}, keys sorted bytewise and
-// same-key values grouped in first-seen order — byte-identical to
-// json.Marshal(map[string][]string). Empty pairs append nothing (a null slot),
-// matching encodeHeaderMap's nil return for an empty map.
-func emitHeadersJSON(dst []byte, pairs []hpair) []byte {
+// emitHeaders writes pairs. No pairs appends nothing, leaving a null slot.
+func emitHeaders(dst []byte, pairs []hpair) []byte {
 	if len(pairs) == 0 {
 		return dst
 	}
-	// Stable sort by key: equal keys stay in VisitAll order, so their values
-	// keep insertion order (matches json's per-slice ordering).
-	slices.SortStableFunc(pairs, func(a, b hpair) int { return bytes.Compare(a.key, b.key) })
-
-	dst = append(dst, '{')
-	for i := 0; i < len(pairs); {
-		k := pairs[i].key
-		if i > 0 {
-			dst = append(dst, ',')
-		}
-		dst = appendJSONString(dst, k)
-		dst = append(dst, ':', '[')
-		j := i
-		for j < len(pairs) && bytes.Equal(pairs[j].key, k) {
-			if j > i {
-				dst = append(dst, ',')
-			}
-			dst = appendJSONString(dst, pairs[j].val)
-			j++
-		}
-		dst = append(dst, ']')
-		i = j
+	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(pairs)))
+	for _, p := range pairs {
+		dst = binary.LittleEndian.AppendUint32(dst, uint32(len(p.key)))
+		dst = append(dst, p.key...)
+		dst = binary.LittleEndian.AppendUint32(dst, uint32(len(p.val)))
+		dst = append(dst, p.val...)
 	}
-	return append(dst, '}')
+	return dst
 }
 
-// appendJSONString appends s as a JSON string literal, byte-identical to
-// encoding/json with the default HTML escaping. The fast path bulk-copies
-// values made only of "clean" ASCII (0x20..0x7e minus " \ < > &), which
-// encoding/json emits verbatim; anything else (control bytes, HTML-escaped
-// chars, or any byte >= 0x7f needing UTF-8 / U+2028-9 handling) defers to the
-// standard encoder for that one string, so the bytes always match exactly.
-func appendJSONString(dst, s []byte) []byte {
-	if jsonCleanASCII(s) {
-		dst = append(dst, '"')
-		dst = append(dst, s...)
-		return append(dst, '"')
-	}
-	b, _ := json.Marshal(unsafeString(s))
-	return append(dst, b...)
-}
+// errHeaderShort reports a header block that ends mid-field.
+var errHeaderShort = errors.New("zaphttp: truncated header block")
 
-func jsonCleanASCII(s []byte) bool {
-	for _, b := range s {
-		if b < 0x20 || b > 0x7e || b == '"' || b == '\\' || b == '<' || b == '>' || b == '&' {
-			return false
-		}
-	}
-	return true
-}
-
-// ---- header JSON decode (zero-alloc fast path + safe fallback) ----
-
-// forEachHeaderKV scans a compact, escape-free JSON object of the shape
-// {"k":["v",...],...} and calls fn(key,value) for every value, with slices that
-// alias raw. It returns false — asking the caller to fall back to the standard
-// json decoder — for any input containing an escape or deviating from that
-// exact compact grammar, so correctness holds for arbitrary/foreign frames
-// while the common case stays allocation-free.
-func forEachHeaderKV(raw []byte, fn func(key, val []byte)) bool {
+// forEachHeader calls fn for every pair in raw. Keys and values alias raw and
+// must not outlive it.
+func forEachHeader(raw []byte, fn func(key, val []byte)) error {
 	if len(raw) == 0 {
-		return true
+		return nil
 	}
-	if bytes.IndexByte(raw, '\\') >= 0 {
-		return false
+	if len(raw) < 4 {
+		return errHeaderShort
 	}
-	i := 0
-	if raw[i] != '{' {
-		return false
+	n := binary.LittleEndian.Uint32(raw)
+	i := 4
+	for ; n > 0; n-- {
+		key, ni, err := headerField(raw, i)
+		if err != nil {
+			return err
+		}
+		val, ni2, err := headerField(raw, ni)
+		if err != nil {
+			return err
+		}
+		fn(key, val)
+		i = ni2
 	}
-	i++
-	if i < len(raw) && raw[i] == '}' {
-		return i+1 == len(raw)
-	}
-	for {
-		if i >= len(raw) || raw[i] != '"' {
-			return false
-		}
-		key, ni, ok := scanJSONStr(raw, i)
-		if !ok {
-			return false
-		}
-		i = ni
-		if i >= len(raw) || raw[i] != ':' {
-			return false
-		}
-		i++
-		if i >= len(raw) || raw[i] != '[' {
-			return false
-		}
-		i++
-		if i < len(raw) && raw[i] == ']' {
-			i++
-		} else {
-			for {
-				val, nv, ok := scanJSONStr(raw, i)
-				if !ok {
-					return false
-				}
-				i = nv
-				fn(key, val)
-				if i >= len(raw) {
-					return false
-				}
-				switch raw[i] {
-				case ',':
-					i++
-					continue
-				case ']':
-					i++
-				default:
-					return false
-				}
-				break
-			}
-		}
-		if i >= len(raw) {
-			return false
-		}
-		switch raw[i] {
-		case ',':
-			i++
-			continue
-		case '}':
-			return i+1 == len(raw)
-		default:
-			return false
-		}
-	}
+	return nil
 }
 
-// scanJSONStr reads a JSON string starting at raw[i]=='"', returning the inner
-// bytes (no escapes — the caller guaranteed none) and the index just past the
-// closing quote.
-func scanJSONStr(raw []byte, i int) (s []byte, next int, ok bool) {
-	if i >= len(raw) || raw[i] != '"' {
-		return nil, i, false
+// headerField reads one length-prefixed field starting at i.
+func headerField(raw []byte, i int) ([]byte, int, error) {
+	if i+4 > len(raw) {
+		return nil, 0, errHeaderShort
 	}
-	i++
-	start := i
-	for i < len(raw) {
-		if raw[i] == '"' {
-			return raw[start:i], i + 1, true
-		}
-		i++
+	n := int(binary.LittleEndian.Uint32(raw[i:]))
+	i += 4
+	if n < 0 || i+n > len(raw) {
+		return nil, 0, errHeaderShort
 	}
-	return nil, i, false
+	return raw[i : i+n], i + n, nil
 }
 
 // ---- shared helpers ----
