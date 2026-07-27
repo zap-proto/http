@@ -10,15 +10,14 @@
 // byte offsets within each object's fixed payload. There is no external
 // codec dependency: codec.go is the encoder and decoder.
 //
-// # Wire compatibility
+// # Wire
 //
-// The frame format is UNCHANGED from the prior net/http codec — same
-// object slots, same offsets, same JSON header map, same flags
-// discriminator. This file's marshal/unmarshal entry points now drive the
-// zero-allocation codec in codec.go, which emits and parses the SAME bytes
-// the zap.Builder path did (verified byte-for-byte by the golden-wire tests
-// and TestCodec_CrossCheck). A fasthttp peer and a net/http peer still
-// interoperate on the wire.
+// Object slots, offsets and the flags discriminator are stable. Headers moved
+// from a JSON map to length-prefixed pairs — a JSON encoder inside a zero-copy
+// binary protocol was buying escaping, sorting and a grammar nobody needed, and
+// it forced two implementations to be kept byte-identical. The golden-wire
+// tests pin the current bytes; they were regenerated once, deliberately, for
+// that change. Peers must agree on the version.
 //
 // What's covered:
 //   - Request method, target, headers, body
@@ -46,17 +45,16 @@
 // Three fields are owned by the frame, not the headers slot: Content-Length
 // (the frame length-prefixes the body), Host (fasthttp's Host slot), and
 // Trailer (the dedicated trailer slot). Everything else rides in the headers
-// slot as a JSON map[string][]string — the native lossless shape for
-// multi-value header names (RFC 9110 §5.2).
+// slot as length-prefixed name/value pairs. A repeated name is simply a
+// repeated pair, which covers multi-value headers (RFC 9110 §5.2) without
+// modelling a list.
 
 package zaphttp
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"net/textproto"
-	"strings"
 
 	"github.com/valyala/fasthttp"
 	zap "github.com/zap-proto/go"
@@ -80,7 +78,7 @@ const (
 	FrameEnd          uint16 = 0x05
 )
 
-// Data/End frame layout: a single bytes slot (the chunk, or the trailer JSON).
+// Data/End frame layout: a single bytes slot (the chunk, or the trailer pairs).
 const (
 	chunkBytes    = 0 // bytes (8)
 	chunkSlotSize = 8
@@ -93,9 +91,9 @@ const (
 	reqMethod   = 0  // text  (8)
 	reqTarget   = 8  // text  (8)
 	reqProto    = 16 // text  (8)
-	reqHeaders  = 24 // bytes (8) -- JSON map[string][]string
+	reqHeaders  = 24 // bytes (8) -- name/value pairs
 	reqBody     = 32 // bytes (8)
-	reqTrailer  = 40 // bytes (8) -- JSON map[string][]string
+	reqTrailer  = 40 // bytes (8) -- name/value pairs
 	reqSlotSize = 48
 )
 
@@ -105,9 +103,9 @@ const (
 	respStatus   = 0  // uint16 (2)
 	respReason   = 8  // text   (8)
 	respProto    = 16 // text   (8)
-	respHeaders  = 24 // bytes  (8) -- JSON map[string][]string
+	respHeaders  = 24 // bytes  (8) -- name/value pairs
 	respBody     = 32 // bytes  (8)
-	respTrailer  = 40 // bytes  (8) -- JSON map[string][]string
+	respTrailer  = 40 // bytes  (8) -- name/value pairs
 	respSlotSize = 48
 )
 
@@ -236,7 +234,7 @@ func MarshalResponseHead(resp *fasthttp.Response) ([]byte, error) {
 	dst = putVarBytes(dst, obj+respProto, proto)
 
 	hStart := len(dst)
-	dst = appendResponseHeadersJSON(dst, &resp.Header, newTrailerSkip(&resp.Header))
+	dst = appendHeaders(dst, &resp.Header, newTrailerSkip(&resp.Header))
 	dst = patchVarSlot(dst, obj+respHeaders, hStart)
 	// body and trailer slots stay null.
 
@@ -293,125 +291,50 @@ func DataChunkOf(frame []byte) ([]byte, error) {
 	return readVar(frame, size, root, chunkBytes), nil
 }
 
-// ---- header decode (JSON -> fasthttp) ----
+// ---- header decode ----
 
-// decodeRequestHeaders applies a request's headers JSON to h. The fast path in
-// forEachHeaderKV handles the common compact, escape-free case with zero
-// allocation; anything else falls back to the standard json decoder. Host and
-// Content-Length are frame-owned (Host reconstructed here, Content-Length set
-// by SetBody), matching the reference codec.
+// decodeRequestHeaders applies a request's headers to h. Host and
+// Content-Length are frame-owned: Host is reconstructed here, Content-Length is
+// set authoritatively by SetBody.
 func decodeRequestHeaders(h *fasthttp.RequestHeader, raw []byte) error {
-	if forEachHeaderKV(raw, func(key, val []byte) {
+	return forEachHeader(raw, func(key, val []byte) {
 		switch {
 		case bytesEqualFold(key, strHost):
 			h.SetHostBytes(val) // last value wins
 		case bytesEqualFold(key, strContentLength):
-			// frame-owned; SetBody sets the authoritative length.
+			// frame-owned
 		default:
 			h.AddBytesKV(key, val)
 		}
-	}) {
-		return nil
-	}
-	return decodeRequestHeadersSlow(h, raw)
-}
-
-func decodeRequestHeadersSlow(h *fasthttp.RequestHeader, raw []byte) error {
-	m, err := decodeHeaderMap(raw)
-	if err != nil {
-		return err
-	}
-	for k, vals := range m {
-		switch {
-		case strings.EqualFold(k, fasthttp.HeaderHost):
-			if len(vals) > 0 {
-				h.SetHost(vals[len(vals)-1])
-			}
-		case strings.EqualFold(k, fasthttp.HeaderContentLength):
-			// frame-owned
-		default:
-			for _, v := range vals {
-				h.Add(k, v)
-			}
-		}
-	}
-	return nil
+	})
 }
 
 func decodeResponseHeaders(h *fasthttp.ResponseHeader, raw []byte) error {
-	if forEachHeaderKV(raw, func(key, val []byte) {
+	return forEachHeader(raw, func(key, val []byte) {
 		if bytesEqualFold(key, strContentLength) {
 			return // frame-owned
 		}
 		h.AddBytesKV(key, val)
-	}) {
-		return nil
-	}
-	return decodeResponseHeadersSlow(h, raw)
-}
-
-func decodeResponseHeadersSlow(h *fasthttp.ResponseHeader, raw []byte) error {
-	m, err := decodeHeaderMap(raw)
-	if err != nil {
-		return err
-	}
-	for k, vals := range m {
-		if strings.EqualFold(k, fasthttp.HeaderContentLength) {
-			continue // frame-owned
-		}
-		for _, v := range vals {
-			h.Add(k, v)
-		}
-	}
-	return nil
-}
-
-func decodeHeaderMap(b []byte) (map[string][]string, error) {
-	if len(b) == 0 {
-		return nil, nil
-	}
-	m := map[string][]string{}
-	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, err
-	}
-	return m, nil
+	})
 }
 
 // ---- trailers ----
 
-// encodeTrailers serializes declared trailers (rare) as JSON for the frame's
-// trailer slot. Empty (the common case) returns nil — a null slot — with no
-// allocation.
+// encodeTrailers writes declared trailers (rare) into the frame's trailer slot,
+// in the same pair encoding as headers. None returns nil — a null slot.
 func encodeTrailers(h trailerHeader) ([]byte, error) {
-	return encodeHeaderMap(collectTrailers(h))
-}
-
-// encodeHeaderMap serializes a header map as JSON. An empty map encodes as nil
-// (the null slot), which decode maps back to no headers — byte-identical to the
-// reference codec's empty path.
-func encodeHeaderMap(m map[string][]string) ([]byte, error) {
-	if len(m) == 0 {
-		return nil, nil
-	}
-	return json.Marshal(m)
-}
-
-// collectTrailers reads declared trailer names and their values (stored in the
-// general header store) into a map[string][]string. Works for both request and
-// response headers via the trailerHeader interface.
-func collectTrailers(h trailerHeader) map[string][]string {
 	keys := h.PeekTrailerKeys()
 	if len(keys) == 0 {
-		return nil
+		return nil, nil
 	}
-	m := map[string][]string{}
+	var pairs []hpair
 	for _, k := range keys {
-		ck := textproto.CanonicalMIMEHeaderKey(string(k))
+		ck := []byte(textproto.CanonicalMIMEHeaderKey(string(k)))
 		for _, v := range h.PeekAll(string(k)) {
-			m[ck] = append(m[ck], string(v))
+			pairs = append(pairs, hpair{ck, v})
 		}
 	}
-	return m
+	return emitHeaders(nil, pairs), nil
 }
 
 // trailerHeader is the shared subset of *fasthttp.RequestHeader and
@@ -423,23 +346,15 @@ type trailerHeader interface {
 
 // applyTrailers declares each trailer name and re-adds its value(s). A name
 // fasthttp forbids as a trailer (framing/routing/auth field) is carried as an
-// ordinary header so no data is dropped — lenient by design, since the frame's
-// trailer slot is opaque JSON.
+// ordinary header so no data is dropped.
 func applyTrailers(h trailerSetter, raw []byte) error {
-	m, err := decodeHeaderMap(raw)
-	if err != nil {
-		return err
-	}
-	for k, vals := range m {
+	return forEachHeader(raw, func(key, val []byte) {
+		k := string(key)
 		_ = h.AddTrailer(k)
-		for _, v := range vals {
-			h.Add(k, v)
-		}
-	}
-	return nil
+		h.Add(k, string(val))
+	})
 }
 
-// trailerSetter is the shared subset of *fasthttp.RequestHeader and
 // *fasthttp.ResponseHeader used to reapply trailers.
 type trailerSetter interface {
 	AddTrailer(trailer string) error

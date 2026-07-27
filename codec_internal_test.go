@@ -1,270 +1,107 @@
 package zaphttp
 
 import (
-	"bytes"
-	"encoding/json"
-	"net/textproto"
 	"strings"
 	"testing"
 
 	"github.com/valyala/fasthttp"
-	zap "github.com/zap-proto/go"
 )
 
-// White-box tests proving the zero-alloc codec is byte-identical to the
-// standard library (for the headers JSON) and to the reference zap.Builder path
-// (for whole frames), plus -benchmem benchmarks documenting allocs/op.
+// White-box tests for the header pair encoding and -benchmem benchmarks
+// documenting allocs/op.
+//
+// There used to be a second, JSON-shaped encoder here kept byte-identical to
+// encoding/json, plus a reference implementation to cross-check the fast one
+// against. Both are gone: headers are length-prefixed pairs now, there is one
+// encoder and one decoder, and nothing to keep in sync.
 
-// ---- header JSON byte-identity vs encoding/json ----
+// TestHeaders_RoundTrip covers exactly the values JSON needed escaping for —
+// quotes, backslashes, HTML bytes, non-ASCII — plus a repeated name, which the
+// pair encoding carries without needing to model a list.
+func TestHeaders_RoundTrip(t *testing.T) {
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	req.SetRequestURI("http://example.test/v1/x")
+	req.Header.SetMethod("POST")
+	req.Header.Add("X-Multi", "one")
+	req.Header.Add("X-Multi", "two")
+	req.Header.Set("X-Quote", `he said "hi" \ <b>&</b>`)
+	req.Header.Set("X-Unicode", "héllo → 世界")
+	req.SetBody([]byte("body"))
 
-func TestAppendJSONString_matchesStdlib(t *testing.T) {
-	cases := []string{
-		"",
-		"simple",
-		"text/plain; charset=utf-8",
-		"application/json",
-		"Bearer abc.def.ghi",
-		`he said "quote"`,
-		`back\slash`,
-		"tab\tnewline\ncr\r",
-		"ctrl\x00\x01\x02\x1f",
-		"html <b>&</b> >x<",
-		"slash/and:colon;semi",
-		"café ☕ 世界 — unicode",
-		"line sep para", // U+2028/U+2029: json escapes, we must too
-		"del\x7fbyte",
-		"高性能 ZAP",
+	frame, err := MarshalRequest(req)
+	if err != nil {
+		t.Fatalf("MarshalRequest: %v", err)
 	}
-	for _, s := range cases {
-		got := appendJSONString(nil, []byte(s))
-		want, err := json.Marshal(s)
-		if err != nil {
-			t.Fatalf("json.Marshal(%q): %v", s, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Errorf("appendJSONString(%q)\n got=%s\nwant=%s", s, got, want)
+	var got fasthttp.Request
+	if err := UnmarshalRequest(frame, &got); err != nil {
+		t.Fatalf("UnmarshalRequest: %v", err)
+	}
+
+	if v := string(got.Header.Peek("X-Quote")); v != `he said "hi" \ <b>&</b>` {
+		t.Errorf("X-Quote = %q", v)
+	}
+	if v := string(got.Header.Peek("X-Unicode")); v != "héllo → 世界" {
+		t.Errorf("X-Unicode = %q", v)
+	}
+	var multi []string
+	for _, v := range got.Header.PeekAll("X-Multi") {
+		multi = append(multi, string(v))
+	}
+	if strings.Join(multi, ",") != "one,two" {
+		t.Errorf("X-Multi = %v, want [one two] in order", multi)
+	}
+	if string(got.Body()) != "body" {
+		t.Errorf("body = %q", got.Body())
+	}
+}
+
+// TestHeaders_Empty proves a message with no headers encodes a null slot and
+// decodes back to nothing, rather than erroring on a zero-length block.
+func TestHeaders_Empty(t *testing.T) {
+	var n int
+	if err := forEachHeader(nil, func(k, v []byte) { n++ }); err != nil {
+		t.Fatalf("empty block: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("empty block yielded %d pairs", n)
+	}
+}
+
+// TestHeaders_Truncated proves a malformed block is rejected rather than read
+// past its end — the decoder indexes into the frame, so a bad length must not
+// become an out-of-range read.
+func TestHeaders_Truncated(t *testing.T) {
+	for name, raw := range map[string][]byte{
+		"short count":     {1, 0, 0},
+		"name len past end": {1, 0, 0, 0, 9, 0, 0, 0, 'a', 'b'},
+		"missing value":   {1, 0, 0, 0, 1, 0, 0, 0, 'a'},
+		"value past end":  {1, 0, 0, 0, 1, 0, 0, 0, 'a', 9, 0, 0, 0, 'b'},
+	} {
+		if err := forEachHeader(raw, func(k, v []byte) {}); err == nil {
+			t.Errorf("%s: got nil error, want a truncation error", name)
 		}
 	}
 }
 
-func TestEmitHeadersJSON_matchesStdlib(t *testing.T) {
-	cases := []map[string][]string{
-		{"Content-Type": {"application/json"}},
-		{"Content-Type": {"text/plain; charset=utf-8"}},
-		// multi-key: json sorts keys; we must match
-		{"X-Trace-Id": {"abc-123"}, "Content-Type": {"application/json"}},
-		// multi-value
-		{"X-Multi": {"one", "two", "three"}},
-		// keys that sort non-trivially + values needing escapes
-		{"Z-Last": {"z"}, "A-First": {`a"b`}, "M-Mid": {"<m&m>"}},
-		{"X-Unicode": {"café ☕"}, "X-Ascii": {"plain"}},
-	}
-	for _, m := range cases {
-		var pairs []hpair
-		for k, vals := range m {
-			for _, v := range vals {
-				pairs = append(pairs, hpair{[]byte(k), []byte(v)})
-			}
-		}
-		got := emitHeadersJSON(nil, pairs)
-		want, err := json.Marshal(m)
-		if err != nil {
-			t.Fatalf("json.Marshal: %v", err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Errorf("emitHeadersJSON(%v)\n got=%s\nwant=%s", m, got, want)
-		}
-	}
-}
-
-// ---- whole-frame byte-identity vs the reference zap.Builder path ----
-
-// refMarshalRequest / refMarshalResponse reproduce the prior codec exactly
-// (zap.Builder + json header map), the byte-for-byte oracle the fast codec must
-// match for arbitrary inputs — not just the four captured golden frames.
-
-func refCollect(vis interface {
-	VisitAll(func(k, v []byte))
-	PeekTrailerKeys() [][]byte
-}) map[string][]string {
-	skip := map[string]bool{}
-	for _, k := range vis.PeekTrailerKeys() {
-		skip[strings.ToLower(string(k))] = true
-	}
-	m := map[string][]string{}
-	vis.VisitAll(func(key, value []byte) {
-		k := string(key)
-		lk := strings.ToLower(k)
-		if lk == "host" || lk == "content-length" || lk == "trailer" || skip[lk] {
-			return
-		}
-		m[k] = append(m[k], string(value))
+// TestHeaders_DecodeIsZeroAlloc pins the zero-copy claim: names and values are
+// subslices of the frame, so walking a header block allocates nothing.
+func TestHeaders_DecodeIsZeroAlloc(t *testing.T) {
+	raw := emitHeaders(nil, []hpair{
+		{[]byte("Content-Type"), []byte("application/json")},
+		{[]byte("X-Request-Id"), []byte("abc123")},
+		{[]byte("X-Multi"), []byte("one")},
+		{[]byte("X-Multi"), []byte("two")},
 	})
-	return m
+	var sink int
+	got := testing.AllocsPerRun(200, func() {
+		_ = forEachHeader(raw, func(k, v []byte) { sink += len(k) + len(v) })
+	})
+	if got != 0 {
+		t.Fatalf("forEachHeader allocated %.0f times per run, want 0", got)
+	}
+	_ = sink
 }
-
-func refHeaderJSON(m map[string][]string) []byte {
-	if len(m) == 0 {
-		return nil
-	}
-	b, _ := json.Marshal(m)
-	return b
-}
-
-func refTrailerJSON(vis interface {
-	PeekTrailerKeys() [][]byte
-	PeekAll(string) [][]byte
-}) []byte {
-	keys := vis.PeekTrailerKeys()
-	if len(keys) == 0 {
-		return nil
-	}
-	m := map[string][]string{}
-	for _, k := range keys {
-		ck := textproto.CanonicalMIMEHeaderKey(string(k))
-		for _, v := range vis.PeekAll(string(k)) {
-			m[ck] = append(m[ck], string(v))
-		}
-	}
-	b, _ := json.Marshal(m)
-	return b
-}
-
-func refMarshalRequest(req *fasthttp.Request) []byte {
-	method := string(req.Header.Method())
-	if method == "" {
-		method = "GET"
-	}
-	target := string(req.RequestURI())
-	proto := string(req.Header.Protocol())
-	if proto == "" {
-		proto = defaultProto
-	}
-	headers := refHeaderJSON(refCollect(&req.Header))
-	trailer := refTrailerJSON(&req.Header)
-
-	b := zap.NewBuilder(reqSlotSize + len(req.Body()) + len(headers) + len(trailer) + 64)
-	ob := b.StartObject(reqSlotSize)
-	ob.SetText(reqMethod, method)
-	ob.SetText(reqTarget, target)
-	ob.SetText(reqProto, proto)
-	ob.SetBytes(reqHeaders, headers)
-	ob.SetBytes(reqBody, req.Body())
-	ob.SetBytes(reqTrailer, trailer)
-	ob.FinishAsRoot()
-	return b.FinishWithFlags(FrameRequest << 8)
-}
-
-func refMarshalResponse(resp *fasthttp.Response) []byte {
-	status := resp.StatusCode()
-	if status == 0 {
-		status = fasthttp.StatusOK
-	}
-	reason := string(resp.Header.StatusMessage())
-	if reason == "" {
-		reason = fasthttp.StatusMessage(status)
-	}
-	proto := string(resp.Header.Protocol())
-	if proto == "" {
-		proto = defaultProto
-	}
-	headers := refHeaderJSON(refCollect(&resp.Header))
-	trailer := refTrailerJSON(&resp.Header)
-
-	b := zap.NewBuilder(respSlotSize + len(resp.Body()) + len(headers) + len(trailer) + 64)
-	ob := b.StartObject(respSlotSize)
-	ob.SetUint16(respStatus, uint16(status))
-	ob.SetText(respReason, reason)
-	ob.SetText(respProto, proto)
-	ob.SetBytes(respHeaders, headers)
-	ob.SetBytes(respBody, resp.Body())
-	ob.SetBytes(respTrailer, trailer)
-	ob.FinishAsRoot()
-	return b.FinishWithFlags(FrameResponse << 8)
-}
-
-func TestCodec_CrossCheckRequest(t *testing.T) {
-	build := []func(*fasthttp.Request){
-		func(r *fasthttp.Request) { r.Header.SetMethod("GET"); r.SetRequestURI("/health"); r.Header.SetProtocol("HTTP/1.1") },
-		func(r *fasthttp.Request) {
-			r.Header.SetMethod("POST")
-			r.SetRequestURI("/v1/blocks?height=42")
-			r.Header.SetProtocol("HTTP/1.1")
-			r.Header.Set("Content-Type", "application/json")
-			r.Header.Set("X-Trace-Id", "abc-123")
-			r.SetBody([]byte(`{"jsonrpc":"2.0"}`))
-		},
-		func(r *fasthttp.Request) { // multi-value + special chars
-			r.Header.SetMethod("PUT")
-			r.SetRequestURI("/x")
-			r.Header.Add("X-Multi", "a")
-			r.Header.Add("X-Multi", "b")
-			r.Header.Set("X-Html", "<tag>&amp;</tag>")
-			r.SetBody([]byte("body-\x00\x01"))
-		},
-		func(r *fasthttp.Request) { // empty target edge case
-			r.Header.SetMethod("OPTIONS")
-			r.SetRequestURI("")
-			r.Header.SetProtocol("HTTP/1.1")
-		},
-	}
-	for i, f := range build {
-		req := fasthttp.AcquireRequest()
-		f(req)
-		want := refMarshalRequest(req)
-		got, err := MarshalRequest(req)
-		if err != nil {
-			t.Fatalf("case %d: MarshalRequest: %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Errorf("case %d request frame mismatch\n got=%x\nwant=%x", i, got, want)
-		}
-		fasthttp.ReleaseRequest(req)
-	}
-}
-
-func TestCodec_CrossCheckResponse(t *testing.T) {
-	build := []func(*fasthttp.Response){
-		func(r *fasthttp.Response) { r.SetStatusCode(200); r.Header.SetProtocol([]byte("HTTP/1.1")); r.Header.SetContentType("text/plain; charset=utf-8"); r.SetBodyString("ok") },
-		func(r *fasthttp.Response) {
-			r.SetStatusCode(200)
-			r.Header.SetProtocol([]byte("HTTP/1.1"))
-			r.Header.SetContentType("application/json")
-			r.Header.Set("X-Trace-Id", "abc-123")
-			r.SetBody([]byte(`{"result":"0x2a"}`))
-		},
-		func(r *fasthttp.Response) { // multi-value response header + status msg
-			r.SetStatusCode(418)
-			r.Header.SetContentType("application/octet-stream")
-			r.Header.Add("X-Multi", "one")
-			r.Header.Add("X-Multi", "two")
-			r.SetBody([]byte("payload-\x00\x01-nuls"))
-		},
-		func(r *fasthttp.Response) { // trailers
-			r.SetStatusCode(200)
-			r.Header.SetProtocol([]byte("HTTP/1.1"))
-			r.Header.SetContentType("application/octet-stream")
-			_ = r.Header.AddTrailer("X-Checksum")
-			r.Header.Set("X-Checksum", "deadbeef")
-			r.SetBodyString("streamed")
-		},
-	}
-	for i, f := range build {
-		resp := fasthttp.AcquireResponse()
-		f(resp)
-		want := refMarshalResponse(resp)
-		got, err := MarshalResponse(resp)
-		if err != nil {
-			t.Fatalf("case %d: MarshalResponse: %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Errorf("case %d response frame mismatch\n got=%x\nwant=%x", i, got, want)
-		}
-		fasthttp.ReleaseResponse(resp)
-	}
-}
-
-// ---- benchmarks: allocs/op for the codec hot path ----
 
 func benchRequest() *fasthttp.Request {
 	req := fasthttp.AcquireRequest()
