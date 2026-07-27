@@ -234,7 +234,7 @@ func MarshalResponseHead(resp *fasthttp.Response) ([]byte, error) {
 	dst = putVarBytes(dst, obj+respProto, proto)
 
 	hStart := len(dst)
-	dst = appendHeaders(dst, &resp.Header, newTrailerSkip(&resp.Header))
+	dst = appendResponseHeaders(dst, &resp.Header, newTrailerSkip(&resp.Header))
 	dst = patchVarSlot(dst, obj+respHeaders, hStart)
 	// body and trailer slots stay null.
 

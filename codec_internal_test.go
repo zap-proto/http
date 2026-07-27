@@ -203,3 +203,91 @@ func BenchmarkUnmarshalResponse(b *testing.B) {
 		}
 	}
 }
+
+// The benchmarks above deliberately use a minimal message, and that is a trap
+// worth naming: benchRequest sets only Host, which isFrameOwnedHeaderBytes
+// strips, so its headers slot is NULL and forEachHeader returns on its first
+// line. Those numbers therefore say nothing about the header codec — they
+// measure the frame envelope. The fixtures below carry a realistic header set
+// so the codec being changed is the codec being measured.
+
+func realRequest() *fasthttp.Request {
+	req := fasthttp.AcquireRequest()
+	req.Header.SetMethod("POST")
+	req.SetRequestURI("/v1/chat/completions")
+	req.Header.SetHost("api.hanzo.ai")
+	req.Header.SetContentType("application/json")
+	req.Header.Set("Authorization", "Bearer sk-proj-0123456789abcdef0123456789abcdef")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("User-Agent", "hanzo-sdk-go/1.4.2 (linux; arm64)")
+	req.Header.Set("X-Request-Id", "01J8Z9QK4E7M2N5P8R1T3V6W9Y")
+	req.Header.Set("X-Org-Id", "hanzo")
+	req.Header.Set("X-User-Id", "z")
+	req.Header.Set("Traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	req.SetBodyString(`{"model":"zen-1","messages":[{"role":"user","content":"hi"}]}`)
+	return req
+}
+
+func realResponse() *fasthttp.Response {
+	resp := fasthttp.AcquireResponse()
+	resp.SetStatusCode(200)
+	resp.Header.SetContentType("application/json")
+	resp.Header.Set("X-Request-Id", "01J8Z9QK4E7M2N5P8R1T3V6W9Y")
+	resp.Header.Set("X-Ratelimit-Limit", "10000")
+	resp.Header.Set("X-Ratelimit-Remaining", "9987")
+	resp.Header.Set("Cache-Control", "no-store")
+	resp.Header.Set("Vary", "Accept-Encoding, Authorization")
+	// A perfectly ordinary redirect target. Under the old JSON codec the '&'
+	// alone forced the WHOLE message onto the allocating fallback, because
+	// encoding/json escapes it and the fast path bailed on any escape.
+	resp.Header.Set("Location", "https://ex.test/cb?code=abc&state=xyz")
+	resp.SetBodyString(`{"id":"chatcmpl-9","object":"chat.completion","choices":[]}`)
+	return resp
+}
+
+func BenchmarkAppendRequestReal(b *testing.B) {
+	req := realRequest()
+	defer fasthttp.ReleaseRequest(req)
+	buf := make([]byte, 0, 1024)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf, _ = AppendRequest(buf[:0], req)
+	}
+}
+
+func BenchmarkAppendResponseReal(b *testing.B) {
+	resp := realResponse()
+	defer fasthttp.ReleaseResponse(resp)
+	buf := make([]byte, 0, 1024)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf, _ = AppendResponse(buf[:0], resp)
+	}
+}
+
+func BenchmarkUnmarshalRequestReal(b *testing.B) {
+	req := realRequest()
+	defer fasthttp.ReleaseRequest(req)
+	frame, _ := MarshalRequest(req)
+	var dst fasthttp.Request
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = UnmarshalRequest(frame, &dst)
+	}
+}
+
+func BenchmarkUnmarshalResponseReal(b *testing.B) {
+	resp := realResponse()
+	defer fasthttp.ReleaseResponse(resp)
+	frame, _ := MarshalResponse(resp)
+	var dst fasthttp.Response
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = UnmarshalResponse(frame, &dst)
+	}
+}

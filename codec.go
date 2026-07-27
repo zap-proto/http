@@ -116,7 +116,7 @@ func AppendRequest(dst []byte, req *fasthttp.Request) ([]byte, error) {
 
 	hStart := len(dst)
 	skip := newTrailerSkip(&req.Header)
-	dst = appendHeaders(dst, &req.Header, skip)
+	dst = appendRequestHeaders(dst, &req.Header, skip)
 	dst = patchVarSlot(dst, obj+reqHeaders, hStart)
 
 	dst = putVarBytes(dst, obj+reqBody, req.Body())
@@ -160,7 +160,7 @@ func AppendResponse(dst []byte, resp *fasthttp.Response) ([]byte, error) {
 
 	hStart := len(dst)
 	skip := newTrailerSkip(&resp.Header)
-	dst = appendHeaders(dst, &resp.Header, skip)
+	dst = appendResponseHeaders(dst, &resp.Header, skip)
 	dst = patchVarSlot(dst, obj+respHeaders, hStart)
 
 	dst = putVarBytes(dst, obj+respBody, resp.Body())
@@ -293,16 +293,31 @@ func (s *trailerSkip) has(key []byte) bool {
 // nothing has to model a list. Order is preserved as sent, and there is no
 // escaping, no sort, and no grammar for two implementations to disagree about.
 
-// headerVisitor is the shared shape of *fasthttp.RequestHeader and
-// *fasthttp.ResponseHeader. Generic rather than an interface parameter so each
-// instantiation keeps its VisitAll closure off the heap.
-type headerVisitor interface {
-	VisitAll(f func(key, value []byte))
+// appendRequestHeaders and appendResponseHeaders collect a message's headers
+// and emit them as length-prefixed pairs.
+//
+// Two concrete functions, not one generic over an interface, and that is NOT an
+// oversight to be tidied away. A generic here compiles to a shared GC-shape
+// instantiation (appendHeaders[go.shape.*uint8]), so the VisitAll call goes
+// through a dictionary, escape analysis can no longer prove the closure stays
+// on the stack, and every encode picks up a heap allocation — measured at
+// exactly 1 allocs/op, 32 B/op, on a path documented and benchmarked as
+// allocation-free. Duplicating twelve lines buys back zero-alloc encode.
+func appendRequestHeaders(dst []byte, h *fasthttp.RequestHeader, skip *trailerSkip) []byte {
+	c := hcollectorPool.Get().(*hcollector)
+	c.pairs = c.pairs[:0]
+	h.VisitAll(func(key, value []byte) {
+		if isFrameOwnedHeaderBytes(key) || skip.has(key) {
+			return
+		}
+		c.pairs = append(c.pairs, hpair{key, value})
+	})
+	dst = emitHeaders(dst, c.pairs)
+	hcollectorPool.Put(c)
+	return dst
 }
 
-// appendHeaders writes h's headers to dst, skipping the frame-owned ones and
-// any name declared as a trailer.
-func appendHeaders[H headerVisitor](dst []byte, h H, skip *trailerSkip) []byte {
+func appendResponseHeaders(dst []byte, h *fasthttp.ResponseHeader, skip *trailerSkip) []byte {
 	c := hcollectorPool.Get().(*hcollector)
 	c.pairs = c.pairs[:0]
 	h.VisitAll(func(key, value []byte) {
