@@ -62,7 +62,7 @@ func listen(t *testing.T, handler fasthttp.RequestHandler) (addr string, shutdow
 // response the caller must release.
 func do(t *testing.T, addr, method, path string, body []byte, mutate func(*fasthttp.Request)) *fasthttp.Response {
 	t.Helper()
-	tr := zaphttp.NewTransport(addr)
+	tr := zaphttp.Dial("tcp", addr)
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 	req.Header.SetMethod(method)
@@ -242,7 +242,7 @@ func TestKeepAlive(t *testing.T) {
 	})
 	defer stop()
 
-	tr := zaphttp.NewTransport(addr)
+	tr := zaphttp.Dial("tcp", addr)
 	for i := 0; i < 5; i++ {
 		path := fmt.Sprintf("/req-%d", i)
 		req := fasthttp.AcquireRequest()
@@ -530,7 +530,7 @@ func TestConnReuse(t *testing.T) {
 	defer stop()
 	_ = dials
 
-	tr := zaphttp.NewTransport(addr)
+	tr := zaphttp.Dial("tcp", addr)
 	deadline := time.Now().Add(2 * time.Second)
 	for i := 0; i < 3 && time.Now().Before(deadline); i++ {
 		resp := fasthttp.AcquireResponse()

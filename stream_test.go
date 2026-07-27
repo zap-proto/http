@@ -34,7 +34,7 @@ func TestStream_SSEOverZAP(t *testing.T) {
 	})
 	defer stop()
 
-	tr := zaphttp.NewTransport(addr)
+	tr := zaphttp.Dial("tcp", addr)
 	defer tr.CloseIdleConnections()
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
