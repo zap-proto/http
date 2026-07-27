@@ -15,9 +15,11 @@ package zaphttp
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -27,7 +29,11 @@ import (
 // Server is a ZAP-HTTP server. Zero-value is usable; common knobs (Addr,
 // Handler, ReadTimeout, …) mirror fasthttp.Server.
 type Server struct {
-	Addr         string                  // ":9999" if empty
+	Addr string // ":9999" if empty
+	// Network mirrors net.Listen's first argument: "tcp" when empty, or
+	// "unix" to serve the same ZAP frames on a socket path given in Addr.
+	// The wire is identical either way; only the plumbing differs.
+	Network      string
 	Handler      fasthttp.RequestHandler // required
 	ReadTimeout  time.Duration           // 0 means no timeout
 	WriteTimeout time.Duration
@@ -52,7 +58,22 @@ func (s *Server) ListenAndServe() error {
 	if addr == "" {
 		addr = ":9999"
 	}
-	ln, err := net.Listen("tcp", addr)
+	network := s.Network
+	if network == "" {
+		network = "tcp"
+	}
+	if network == "unix" {
+		// A unix socket outlives the process that made it, so a crashed or
+		// SIGKILLed predecessor leaves a file that bind refuses. Clearing a
+		// stale socket is what makes restart-in-place work; a live one still
+		// fails, because something is genuinely listening.
+		if c, err := net.DialTimeout("unix", addr, 200*time.Millisecond); err == nil {
+			_ = c.Close()
+			return fmt.Errorf("zaphttp: %s is already served by a live process", addr)
+		}
+		_ = os.Remove(addr)
+	}
+	ln, err := net.Listen(network, addr)
 	if err != nil {
 		return err
 	}

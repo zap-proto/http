@@ -2,7 +2,7 @@
 //
 // Usage mirrors fasthttp's Do(req, resp):
 //
-//	t := zaphttp.NewTransport("server:9999")
+//	t := zaphttp.Dial("tcp", "server:9999")
 //	req := fasthttp.AcquireRequest()
 //	resp := fasthttp.AcquireResponse()
 //	req.SetRequestURI("/healthz")
@@ -39,9 +39,10 @@ type pooledConn struct {
 	rbuf []byte // inbound response frame
 }
 
-// Transport speaks ZAP-HTTP over a pooled TCP connection. Field-zero is
-// invalid; use NewTransport.
+// Transport speaks ZAP over a pooled connection. Field-zero is invalid; use
+// Dial.
 type Transport struct {
+	network      string
 	addr         string
 	dialTimeout  time.Duration
 	readTimeout  time.Duration
@@ -51,9 +52,21 @@ type Transport struct {
 	idle []*pooledConn // LIFO; most-recently-returned is hottest
 }
 
-// NewTransport returns a Transport connecting to the given host:port.
-func NewTransport(addr string) *Transport {
+// Dial returns a Transport that speaks ZAP to addr over network, mirroring
+// net.Dial: the network is a value ("tcp", "unix", …), not a family of
+// functions. A unix address is a socket path and carries the same ZAP frames
+// as tcp — the wire does not change with the network.
+//
+//	zaphttp.Dial("tcp", "billing.hanzo.svc:9653")
+//	zaphttp.Dial("unix", "/run/hanzo/billing.sock")
+//
+// Dialing is lazy; the first request opens the connection.
+func Dial(network, addr string) *Transport {
+	if network == "" {
+		network = "tcp"
+	}
 	return &Transport{
+		network:      network,
 		addr:         addr,
 		dialTimeout:  10 * time.Second,
 		readTimeout:  30 * time.Second,
@@ -80,7 +93,7 @@ func (t *Transport) SetMaxIdleConns(n int) {
 // for concurrent use: each call takes its own connection from the pool.
 func (t *Transport) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
 	if t.addr == "" {
-		return fmt.Errorf("zaphttp: Transport.addr is empty (use NewTransport)")
+		return fmt.Errorf("zaphttp: Transport.addr is empty (use Dial)")
 	}
 
 	pc, err := t.acquireConn()
@@ -232,7 +245,7 @@ func (t *Transport) acquireConn() (*pooledConn, error) {
 	}
 	t.mu.Unlock()
 
-	c, err := net.DialTimeout("tcp", t.addr, t.dialTimeout)
+	c, err := net.DialTimeout(t.network, t.addr, t.dialTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -271,7 +284,7 @@ func (t *Transport) CloseIdleConnections() {
 // Get is a convenience for one-shot service-to-service calls. The caller
 // owns resp and must fasthttp.ReleaseResponse it when done.
 func Get(addr, path string) (*fasthttp.Response, error) {
-	t := NewTransport(addr)
+	t := Dial("tcp", addr)
 	defer t.CloseIdleConnections()
 
 	req := fasthttp.AcquireRequest()
