@@ -129,7 +129,6 @@ By the [composability theorem](https://github.com/zap-proto/papers/tree/main/com
 ## Schema regeneration
 
 ```sh
-make schema    # regenerates internal/wire/zap_http.go from schema/http.zap
 ```
 
 Requires `zapc` (the ZAP schema compiler) on PATH. Build it once from
