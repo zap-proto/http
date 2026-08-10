@@ -1,4 +1,4 @@
-package zaphttp
+package zap
 
 import (
 	"strings"
