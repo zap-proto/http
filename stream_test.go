@@ -1,4 +1,4 @@
-package zaphttp_test
+package zap_test
 
 import (
 	"bufio"
@@ -8,7 +8,7 @@ import (
 
 	"github.com/valyala/fasthttp"
 
-	zaphttp "github.com/zap-proto/http"
+	"github.com/zap-proto/http"
 )
 
 // TestStream_SSEOverZAP proves server→client PUSH over ZAP: an SSE handler that
@@ -34,7 +34,7 @@ func TestStream_SSEOverZAP(t *testing.T) {
 	})
 	defer stop()
 
-	tr := zaphttp.Dial("tcp", addr)
+	tr := zap.Dial("tcp", addr)
 	defer tr.CloseIdleConnections()
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()

@@ -1,4 +1,4 @@
-package zaphttp_test
+package zap_test
 
 // Exported-API-only codec benchmarks. These use only MarshalRequest /
 // MarshalResponse / UnmarshalRequest / UnmarshalResponse, so the SAME file
@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/valyala/fasthttp"
-	zaphttp "github.com/zap-proto/http"
+	"github.com/zap-proto/http"
 )
 
 func compatReq() *fasthttp.Request {
@@ -34,7 +34,7 @@ func BenchmarkCompat_MarshalRequest(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := zaphttp.MarshalRequest(req); err != nil {
+		if _, err := zap.MarshalRequest(req); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -46,7 +46,7 @@ func BenchmarkCompat_MarshalResponse(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := zaphttp.MarshalResponse(resp); err != nil {
+		if _, err := zap.MarshalResponse(resp); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -54,13 +54,13 @@ func BenchmarkCompat_MarshalResponse(b *testing.B) {
 
 func BenchmarkCompat_UnmarshalRequest(b *testing.B) {
 	req := compatReq()
-	frame, _ := zaphttp.MarshalRequest(req)
+	frame, _ := zap.MarshalRequest(req)
 	fasthttp.ReleaseRequest(req)
 	var dst fasthttp.Request
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := zaphttp.UnmarshalRequest(frame, &dst); err != nil {
+		if err := zap.UnmarshalRequest(frame, &dst); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -68,13 +68,13 @@ func BenchmarkCompat_UnmarshalRequest(b *testing.B) {
 
 func BenchmarkCompat_UnmarshalResponse(b *testing.B) {
 	resp := compatResp()
-	frame, _ := zaphttp.MarshalResponse(resp)
+	frame, _ := zap.MarshalResponse(resp)
 	fasthttp.ReleaseResponse(resp)
 	var dst fasthttp.Response
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := zaphttp.UnmarshalResponse(frame, &dst); err != nil {
+		if err := zap.UnmarshalResponse(frame, &dst); err != nil {
 			b.Fatal(err)
 		}
 	}
