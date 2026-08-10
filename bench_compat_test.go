@@ -1,4 +1,4 @@
-package zap_test
+package http_test
 
 // Exported-API-only codec benchmarks. These use only MarshalRequest /
 // MarshalResponse / UnmarshalRequest / UnmarshalResponse, so the SAME file
@@ -34,7 +34,7 @@ func BenchmarkCompat_MarshalRequest(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := zap.MarshalRequest(req); err != nil {
+		if _, err := http.MarshalRequest(req); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -46,7 +46,7 @@ func BenchmarkCompat_MarshalResponse(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := zap.MarshalResponse(resp); err != nil {
+		if _, err := http.MarshalResponse(resp); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -54,13 +54,13 @@ func BenchmarkCompat_MarshalResponse(b *testing.B) {
 
 func BenchmarkCompat_UnmarshalRequest(b *testing.B) {
 	req := compatReq()
-	frame, _ := zap.MarshalRequest(req)
+	frame, _ := http.MarshalRequest(req)
 	fasthttp.ReleaseRequest(req)
 	var dst fasthttp.Request
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := zap.UnmarshalRequest(frame, &dst); err != nil {
+		if err := http.UnmarshalRequest(frame, &dst); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -68,13 +68,13 @@ func BenchmarkCompat_UnmarshalRequest(b *testing.B) {
 
 func BenchmarkCompat_UnmarshalResponse(b *testing.B) {
 	resp := compatResp()
-	frame, _ := zap.MarshalResponse(resp)
+	frame, _ := http.MarshalResponse(resp)
 	fasthttp.ReleaseResponse(resp)
 	var dst fasthttp.Response
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := zap.UnmarshalResponse(frame, &dst); err != nil {
+		if err := http.UnmarshalResponse(frame, &dst); err != nil {
 			b.Fatal(err)
 		}
 	}

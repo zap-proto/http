@@ -6,7 +6,7 @@
 // accidental format change fails loudly. They were regenerated once,
 // deliberately, when headers moved from a JSON map to length-prefixed pairs.
 
-package zap_test
+package http_test
 
 import (
 	"bytes"
@@ -42,7 +42,7 @@ func listen(t *testing.T, handler fasthttp.RequestHandler) (addr string, shutdow
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	srv := &zap.Server{Handler: handler}
+	srv := &http.Server{Handler: handler}
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -61,7 +61,7 @@ func listen(t *testing.T, handler fasthttp.RequestHandler) (addr string, shutdow
 // response the caller must release.
 func do(t *testing.T, addr, method, path string, body []byte, mutate func(*fasthttp.Request)) *fasthttp.Response {
 	t.Helper()
-	tr := zap.Dial("tcp", addr)
+	tr := http.Dial("tcp", addr)
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 	req.Header.SetMethod(method)
@@ -241,7 +241,7 @@ func TestKeepAlive(t *testing.T) {
 	})
 	defer stop()
 
-	tr := zap.Dial("tcp", addr)
+	tr := http.Dial("tcp", addr)
 	for i := 0; i < 5; i++ {
 		path := fmt.Sprintf("/req-%d", i)
 		req := fasthttp.AcquireRequest()
@@ -271,12 +271,12 @@ func TestMarshalRequest_idempotent(t *testing.T) {
 	orig.Header.Set("Authorization", "Bearer token-stays-encrypted-on-the-wire")
 	orig.SetBody(body)
 
-	frame, err := zap.MarshalRequest(orig)
+	frame, err := http.MarshalRequest(orig)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 	var got fasthttp.Request
-	if err := zap.UnmarshalRequest(frame, &got); err != nil {
+	if err := http.UnmarshalRequest(frame, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if string(got.Header.Method()) != fasthttp.MethodPost {
@@ -314,12 +314,12 @@ func TestMarshalResponse_idempotent(t *testing.T) {
 	}
 	orig.Header.Set("X-Checksum", "deadbeef")
 
-	frame, err := zap.MarshalResponse(orig)
+	frame, err := http.MarshalResponse(orig)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 	var got fasthttp.Response
-	if err := zap.UnmarshalResponse(frame, &got); err != nil {
+	if err := http.UnmarshalResponse(frame, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if got.StatusCode() != fasthttp.StatusTeapot {
@@ -345,24 +345,24 @@ func TestFrameType_crossGuard(t *testing.T) {
 	defer fasthttp.ReleaseRequest(req)
 	req.Header.SetMethod(fasthttp.MethodGet)
 	req.SetRequestURI("/x")
-	reqFrame, err := zap.MarshalRequest(req)
+	reqFrame, err := http.MarshalRequest(req)
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
 	}
 	var asResp fasthttp.Response
-	if err := zap.UnmarshalResponse(reqFrame, &asResp); err == nil {
+	if err := http.UnmarshalResponse(reqFrame, &asResp); err == nil {
 		t.Errorf("UnmarshalResponse accepted a request frame; want error")
 	}
 
 	resp := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseResponse(resp)
 	resp.SetStatusCode(fasthttp.StatusOK)
-	respFrame, err := zap.MarshalResponse(resp)
+	respFrame, err := http.MarshalResponse(resp)
 	if err != nil {
 		t.Fatalf("marshal response: %v", err)
 	}
 	var asReq fasthttp.Request
-	if err := zap.UnmarshalRequest(respFrame, &asReq); err == nil {
+	if err := http.UnmarshalRequest(respFrame, &asReq); err == nil {
 		t.Errorf("UnmarshalRequest accepted a response frame; want error")
 	}
 }
@@ -372,12 +372,12 @@ func TestEmptyHeaders_decode(t *testing.T) {
 	defer fasthttp.ReleaseRequest(req)
 	req.Header.SetMethod(fasthttp.MethodGet)
 	req.SetRequestURI("/")
-	frame, err := zap.MarshalRequest(req)
+	frame, err := http.MarshalRequest(req)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 	var got fasthttp.Request
-	if err := zap.UnmarshalRequest(frame, &got); err != nil {
+	if err := http.UnmarshalRequest(frame, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	got.Header.Add("X-Added", "ok") // must not panic
@@ -401,7 +401,7 @@ func mustHex(t *testing.T, s string) []byte {
 // produced by the prior net/http codec faithfully (backward wire compat).
 func TestWireGolden_DecodeRequest(t *testing.T) {
 	var req fasthttp.Request
-	if err := zap.UnmarshalRequest(mustHex(t, goldenRequest), &req); err != nil {
+	if err := http.UnmarshalRequest(mustHex(t, goldenRequest), &req); err != nil {
 		t.Fatalf("decode golden request: %v", err)
 	}
 	if string(req.Header.Method()) != "POST" {
@@ -423,7 +423,7 @@ func TestWireGolden_DecodeRequest(t *testing.T) {
 
 func TestWireGolden_DecodeResponse(t *testing.T) {
 	var resp fasthttp.Response
-	if err := zap.UnmarshalResponse(mustHex(t, goldenResponse), &resp); err != nil {
+	if err := http.UnmarshalResponse(mustHex(t, goldenResponse), &resp); err != nil {
 		t.Fatalf("decode golden response: %v", err)
 	}
 	if resp.StatusCode() != 200 {
@@ -452,7 +452,7 @@ func TestWireGolden_EncodeRequest(t *testing.T) {
 	req.Header.Set("X-Trace-Id", "abc-123")
 	req.SetBody([]byte(`{"jsonrpc":"2.0","method":"eth_blockNumber"}`))
 
-	frame, err := zap.MarshalRequest(req)
+	frame, err := http.MarshalRequest(req)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -470,7 +470,7 @@ func TestWireGolden_EncodeResponse(t *testing.T) {
 	resp.Header.Set("X-Trace-Id", "abc-123")
 	resp.SetBody([]byte(`{"result":"0x2a"}`))
 
-	frame, err := zap.MarshalResponse(resp)
+	frame, err := http.MarshalResponse(resp)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -486,7 +486,7 @@ func TestWireGolden_EncodeEmptyRequest(t *testing.T) {
 	req.SetRequestURI("/health")
 	req.Header.SetProtocol("HTTP/1.1")
 
-	frame, err := zap.MarshalRequest(req)
+	frame, err := http.MarshalRequest(req)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -500,7 +500,7 @@ func TestWireGolden_EncodeEmptyRequest(t *testing.T) {
 // codec's output.
 func TestWireGolden_TrailerResponse(t *testing.T) {
 	var resp fasthttp.Response
-	if err := zap.UnmarshalResponse(mustHex(t, goldenTrailerResponse), &resp); err != nil {
+	if err := http.UnmarshalResponse(mustHex(t, goldenTrailerResponse), &resp); err != nil {
 		t.Fatalf("decode golden trailer response: %v", err)
 	}
 	if string(resp.Header.ContentType()) != "application/octet-stream" {
@@ -512,7 +512,7 @@ func TestWireGolden_TrailerResponse(t *testing.T) {
 	if cs := string(resp.Header.Peek("X-Checksum")); cs != "deadbeef" {
 		t.Errorf("trailer X-Checksum = %q want deadbeef", cs)
 	}
-	frame, err := zap.MarshalResponse(&resp)
+	frame, err := http.MarshalResponse(&resp)
 	if err != nil {
 		t.Fatalf("re-marshal: %v", err)
 	}
@@ -529,7 +529,7 @@ func TestConnReuse(t *testing.T) {
 	defer stop()
 	_ = dials
 
-	tr := zap.Dial("tcp", addr)
+	tr := http.Dial("tcp", addr)
 	deadline := time.Now().Add(2 * time.Second)
 	for i := 0; i < 3 && time.Now().Before(deadline); i++ {
 		resp := fasthttp.AcquireResponse()
