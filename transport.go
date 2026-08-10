@@ -11,7 +11,7 @@
 // across exchanges (HTTP/1.1-style keep-alive); the transport itself
 // does not pipeline.
 
-package zap
+package http
 
 import (
 	"bufio"
@@ -52,10 +52,10 @@ func readFrameInto(r *bufio.Reader, buf []byte) ([]byte, error) {
 		return buf, err
 	}
 	if n == 0 {
-		return buf, fmt.Errorf("zap: zero-length frame")
+		return buf, fmt.Errorf("zaphttp: zero-length frame")
 	}
 	if n > MaxFrameSize {
-		return buf, fmt.Errorf("zap: frame size %d exceeds MaxFrameSize=%d", n, MaxFrameSize)
+		return buf, fmt.Errorf("zaphttp: frame size %d exceeds MaxFrameSize=%d", n, MaxFrameSize)
 	}
 	if uint32(cap(buf)) < n {
 		buf = make([]byte, n)
@@ -65,7 +65,7 @@ func readFrameInto(r *bufio.Reader, buf []byte) ([]byte, error) {
 	// buf is already heap-backed (persistent across calls), so ReadFull's
 	// interface indirection costs no new allocation here.
 	if _, err := io.ReadFull(r, buf); err != nil {
-		return buf, fmt.Errorf("zap: short frame: %w", err)
+		return buf, fmt.Errorf("zaphttp: short frame: %w", err)
 	}
 	return buf, nil
 }
@@ -77,10 +77,10 @@ func readFrameInto(r *bufio.Reader, buf []byte) ([]byte, error) {
 func writeFramePrefixed(w io.Writer, framePlusPrefix []byte) error {
 	body := len(framePlusPrefix) - 4
 	if body <= 0 {
-		return fmt.Errorf("zap: refusing to write zero-length frame")
+		return fmt.Errorf("zaphttp: refusing to write zero-length frame")
 	}
 	if uint64(body) > MaxFrameSize {
-		return fmt.Errorf("zap: frame size %d exceeds MaxFrameSize=%d", body, MaxFrameSize)
+		return fmt.Errorf("zaphttp: frame size %d exceeds MaxFrameSize=%d", body, MaxFrameSize)
 	}
 	binary.BigEndian.PutUint32(framePlusPrefix[0:4], uint32(body))
 	_, err := w.Write(framePlusPrefix)
@@ -90,10 +90,10 @@ func writeFramePrefixed(w io.Writer, framePlusPrefix []byte) error {
 // writeFrame writes one length-prefixed frame to w.
 func writeFrame(w io.Writer, frame []byte) error {
 	if len(frame) == 0 {
-		return fmt.Errorf("zap: refusing to write zero-length frame")
+		return fmt.Errorf("zaphttp: refusing to write zero-length frame")
 	}
 	if uint64(len(frame)) > MaxFrameSize {
-		return fmt.Errorf("zap: frame size %d exceeds MaxFrameSize=%d", len(frame), MaxFrameSize)
+		return fmt.Errorf("zaphttp: frame size %d exceeds MaxFrameSize=%d", len(frame), MaxFrameSize)
 	}
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(frame)))

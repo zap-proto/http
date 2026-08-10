@@ -1,4 +1,4 @@
-// Package zap implements HTTP request/response semantics over the
+// Package zaphttp implements HTTP request/response semantics over the
 // ZAP transport for the fasthttp handler model. A fasthttp.RequestHandler
 // is served over ZAP frames; a fasthttp.Request/Response pair is exchanged
 // by the client. There is no net/http in the request path — Fiber and
@@ -49,7 +49,7 @@
 // repeated pair, which covers multi-value headers (RFC 9110 §5.2) without
 // modelling a list.
 
-package zap
+package http
 
 import (
 	"encoding/binary"
@@ -166,10 +166,10 @@ func UnmarshalRequest(frame []byte, dst *fasthttp.Request) error {
 		dst.Header.SetProtocolBytes(proto)
 	}
 	if err := decodeRequestHeaders(&dst.Header, headers); err != nil {
-		return fmt.Errorf("zap: decode headers: %w", err)
+		return fmt.Errorf("zaphttp: decode headers: %w", err)
 	}
 	if err := applyTrailers(&dst.Header, trailer); err != nil {
-		return fmt.Errorf("zap: decode trailer: %w", err)
+		return fmt.Errorf("zaphttp: decode trailer: %w", err)
 	}
 	dst.SetBody(body)
 	return nil
@@ -197,10 +197,10 @@ func UnmarshalResponse(frame []byte, dst *fasthttp.Response) error {
 		dst.Header.SetProtocol(proto)
 	}
 	if err := decodeResponseHeaders(&dst.Header, headers); err != nil {
-		return fmt.Errorf("zap: decode headers: %w", err)
+		return fmt.Errorf("zaphttp: decode headers: %w", err)
 	}
 	if err := applyTrailers(&dst.Header, trailer); err != nil {
-		return fmt.Errorf("zap: decode trailer: %w", err)
+		return fmt.Errorf("zaphttp: decode trailer: %w", err)
 	}
 	dst.SetBody(body)
 	return nil

@@ -2,7 +2,7 @@
 //
 // A Fiber app (or any fasthttp stack) hands its handler straight in:
 //
-//	srv := &zap.Server{Addr: ":9999", Handler: app.Handler()}
+//	srv := &http.Server{Addr: ":9999", Handler: app.Handler()}
 //	srv.ListenAndServe()
 //
 // The server reads ZAP-HTTP frames off each accepted connection,
@@ -10,7 +10,7 @@
 // writes one response frame back from the ctx's Response. Connections are
 // kept alive across requests. There is no net/http anywhere in the path.
 
-package zap
+package http
 
 import (
 	"bufio"
@@ -69,7 +69,7 @@ func (s *Server) ListenAndServe() error {
 		// fails, because something is genuinely listening.
 		if c, err := net.DialTimeout("unix", addr, 200*time.Millisecond); err == nil {
 			_ = c.Close()
-			return fmt.Errorf("zap: %s is already served by a live process", addr)
+			return fmt.Errorf("zaphttp: %s is already served by a live process", addr)
 		}
 		_ = os.Remove(addr)
 	}
@@ -88,7 +88,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	s.mu.Unlock()
 
 	if s.Handler == nil {
-		return errors.New("zap: Server.Handler is nil")
+		return errors.New("zaphttp: Server.Handler is nil")
 	}
 
 	for {
@@ -136,7 +136,7 @@ func (s *Server) serveConn(conn net.Conn) {
 		readBuf, err = readFrameInto(br, readBuf)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !isClosedConn(err) {
-				log.Printf("zap: read frame: %v", err)
+				log.Printf("zaphttp: read frame: %v", err)
 			}
 			return
 		}
@@ -161,7 +161,7 @@ func (s *Server) serveConn(conn net.Conn) {
 				if r := recover(); r != nil {
 					ctx.Response.Reset()
 					ctx.Response.SetStatusCode(fasthttp.StatusInternalServerError)
-					log.Printf("zap: handler panic on %s %s: %v",
+					log.Printf("zaphttp: handler panic on %s %s: %v",
 						ctx.Method(), ctx.RequestURI(), r)
 				}
 			}()
@@ -179,7 +179,7 @@ func (s *Server) serveConn(conn net.Conn) {
 		if ctx.Response.IsBodyStream() {
 			if err := s.streamResponse(conn, &ctx.Response); err != nil {
 				if !isClosedConn(err) {
-					log.Printf("zap: stream response: %v", err)
+					log.Printf("zaphttp: stream response: %v", err)
 				}
 				return
 			}
@@ -191,12 +191,12 @@ func (s *Server) serveConn(conn net.Conn) {
 		writeBuf = append(writeBuf[:0], 0, 0, 0, 0)
 		writeBuf, err = AppendResponse(writeBuf, &ctx.Response)
 		if err != nil {
-			log.Printf("zap: marshal response: %v", err)
+			log.Printf("zaphttp: marshal response: %v", err)
 			return
 		}
 		if err := writeFramePrefixed(conn, writeBuf); err != nil {
 			if !isClosedConn(err) {
-				log.Printf("zap: write frame: %v", err)
+				log.Printf("zaphttp: write frame: %v", err)
 			}
 			return
 		}

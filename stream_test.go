@@ -1,4 +1,4 @@
-package zap_test
+package http_test
 
 import (
 	"bufio"
@@ -34,7 +34,7 @@ func TestStream_SSEOverZAP(t *testing.T) {
 	})
 	defer stop()
 
-	tr := zap.Dial("tcp", addr)
+	tr := http.Dial("tcp", addr)
 	defer tr.CloseIdleConnections()
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
