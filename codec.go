@@ -123,7 +123,7 @@ func AppendRequest(dst []byte, req *fasthttp.Request) ([]byte, error) {
 
 	trailer, err := encodeTrailers(&req.Header)
 	if err != nil {
-		return dst, fmt.Errorf("zaphttp: encode trailer: %w", err)
+		return dst, fmt.Errorf("http: encode trailer: %w", err)
 	}
 	dst = putVarBytes(dst, obj+reqTrailer, trailer)
 
@@ -167,7 +167,7 @@ func AppendResponse(dst []byte, resp *fasthttp.Response) ([]byte, error) {
 
 	trailer, err := encodeTrailers(&resp.Header)
 	if err != nil {
-		return dst, fmt.Errorf("zaphttp: encode trailer: %w", err)
+		return dst, fmt.Errorf("http: encode trailer: %w", err)
 	}
 	dst = putVarBytes(dst, obj+respTrailer, trailer)
 
@@ -198,7 +198,7 @@ func frameRoot(frame []byte, wantType uint16) (root, size int, err error) {
 		return 0, 0, zap.ErrBufferTooSmall
 	}
 	if t := binary.LittleEndian.Uint16(frame[6:8]) >> 8; t != wantType {
-		return 0, 0, fmt.Errorf("zaphttp: frame type %#x, want %#x", t, wantType)
+		return 0, 0, fmt.Errorf("http: frame type %#x, want %#x", t, wantType)
 	}
 	root = int(binary.LittleEndian.Uint32(frame[8:12]))
 	if root < zap.HeaderSize || root >= size {
@@ -347,7 +347,7 @@ func emitHeaders(dst []byte, pairs []hpair) []byte {
 }
 
 // errHeaderShort reports a header block that ends mid-field.
-var errHeaderShort = errors.New("zaphttp: truncated header block")
+var errHeaderShort = errors.New("http: truncated header block")
 
 // forEachHeader calls fn for every pair in raw. Keys and values alias raw and
 // must not outlive it.
