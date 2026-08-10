@@ -4,7 +4,7 @@
 // by the client. There is no net/http in the request path — Fiber and
 // every other fasthttp stack hand their handler straight to this package.
 //
-// The wire format is documented in schema/zap_http.zap (authored in the
+// The wire format is documented in schema/http.zap (authored in the
 // ZAP schema language). The bytes on the wire are github.com/zap-proto/go
 // Objects — the canonical pure-stdlib ZAP runtime — packed at explicit
 // byte offsets within each object's fixed payload. There is no external

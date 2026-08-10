@@ -15,7 +15,7 @@
 // Callers append into a reusable buffer (Append{Request,Response}), so after a
 // connection warms up the steady-state cost is zero heap allocation.
 //
-// # Wire layout (see schema/zap_http.zap)
+// # Wire layout (see schema/http.zap)
 //
 // A frame is one zap-proto/go message: a 16-byte header (magic "ZAP\x00",
 // version=1, flags, rootOffset=16, size) followed by the root object. The root
