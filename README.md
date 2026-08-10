@@ -77,13 +77,13 @@ func main() {
 
 ## Wire format
 
-Each HTTP message is one ZAP frame, defined in [`schema/zap_http.zap`](schema/zap_http.zap) using the ZAP schema language. Today the wire layer is length-prefixed framing over TCP; the [paper](https://github.com/zap-proto/papers/tree/main/transport-vs-jwt) and the v0.2 release will swap that for the full ZAP transport with X-Wing PQ KEM handshake on connect.
+Each HTTP message is one ZAP frame, defined in [`schema/http.zap`](schema/http.zap) using the ZAP schema language. Today the wire layer is length-prefixed framing over TCP; the [paper](https://github.com/zap-proto/papers/tree/main/transport-vs-jwt) and the v0.2 release will swap that for the full ZAP transport with X-Wing PQ KEM handshake on connect.
 
 ```
 zap-http v0.1 wire (transitional):
   +---------+-------------------+
   | u32 BE  |   ZAP Frame       |
-  | length  |   (zap_http.zap)  |
+  | length  |   (http.zap)  |
   +---------+-------------------+
 
 zap-http v0.2 wire:
@@ -129,7 +129,7 @@ By the [composability theorem](https://github.com/zap-proto/papers/tree/main/com
 ## Schema regeneration
 
 ```sh
-make schema    # regenerates internal/wire/zap_http.go from schema/zap_http.zap
+make schema    # regenerates internal/wire/zap_http.go from schema/http.zap
 ```
 
 Requires `zapc` (the ZAP schema compiler) on PATH. Build it once from
