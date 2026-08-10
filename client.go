@@ -93,12 +93,12 @@ func (t *Transport) SetMaxIdleConns(n int) {
 // for concurrent use: each call takes its own connection from the pool.
 func (t *Transport) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
 	if t.addr == "" {
-		return fmt.Errorf("zaphttp: Transport.addr is empty (use Dial)")
+		return fmt.Errorf("http: Transport.addr is empty (use Dial)")
 	}
 
 	pc, err := t.acquireConn()
 	if err != nil {
-		return fmt.Errorf("zaphttp: dial %s: %w", t.addr, err)
+		return fmt.Errorf("http: dial %s: %w", t.addr, err)
 	}
 	conn, br := pc.c, pc.br
 
@@ -112,7 +112,7 @@ func (t *Transport) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
 	}
 	if err := writeFramePrefixed(conn, pc.wbuf); err != nil {
 		conn.Close()
-		return fmt.Errorf("zaphttp: write request: %w", err)
+		return fmt.Errorf("http: write request: %w", err)
 	}
 
 	if t.readTimeout > 0 {
@@ -121,13 +121,13 @@ func (t *Transport) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
 	pc.rbuf, err = readFrameInto(br, pc.rbuf)
 	if err != nil {
 		conn.Close()
-		return fmt.Errorf("zaphttp: read response: %w", err)
+		return fmt.Errorf("http: read response: %w", err)
 	}
 	respFrame := pc.rbuf
 	ft, ok := frameType(respFrame)
 	if !ok {
 		conn.Close()
-		return fmt.Errorf("zaphttp: short response frame")
+		return fmt.Errorf("http: short response frame")
 	}
 
 	// Streamed response: apply the head, then attach a body stream that reads
@@ -138,7 +138,7 @@ func (t *Transport) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
 	if ft == FrameResponseHead {
 		if err := UnmarshalResponseHead(respFrame, resp); err != nil {
 			conn.Close()
-			return fmt.Errorf("zaphttp: unmarshal response head: %w", err)
+			return fmt.Errorf("http: unmarshal response head: %w", err)
 		}
 		resp.SetBodyStream(&streamReader{t: t, pc: pc, br: br}, -1)
 		return nil
@@ -146,7 +146,7 @@ func (t *Transport) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
 
 	if err := UnmarshalResponse(respFrame, resp); err != nil {
 		conn.Close()
-		return fmt.Errorf("zaphttp: unmarshal response: %w", err)
+		return fmt.Errorf("http: unmarshal response: %w", err)
 	}
 
 	// Reset the read deadline and return the conn to the pool. The response
@@ -209,7 +209,7 @@ func (s *streamReader) Read(p []byte) (int, error) {
 		s.release()
 		return 0, io.EOF
 	default:
-		s.err = fmt.Errorf("zaphttp: unexpected frame %#x mid-stream", ft)
+		s.err = fmt.Errorf("http: unexpected frame %#x mid-stream", ft)
 		return 0, s.err
 	}
 }
