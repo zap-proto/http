@@ -390,17 +390,14 @@ func headerField(raw []byte, i int) ([]byte, int, error) {
 
 // ---- shared helpers ----
 
-// isFrameOwnedHeaderBytes reports whether a header name is carried by the frame
-// itself (Content-Length, from the body's own length prefix) or by the trailer
-// slot (Trailer), and so is excluded from the headers slot. Byte-wise EqualFold,
-// so it allocates nothing.
+// isFrameOwnedHeaderBytes reports whether a header is carried by the frame
+// itself (Content-Length, from the body's length prefix) or by the trailer slot,
+// and so is excluded from the headers slot.
 //
-// HOST IS NOT ONE OF THEM, and used to be listed here. Nothing in the frame
-// carries a host: the decoder reconstructs it from a Host HEADER
-// (decodeRequestHeaders), and the encoder was dropping exactly that header. So
-// every request over this wire arrived with an empty Host, and a callee serving
-// more than one brand could not tell which one was asked for. It was invisible
-// because a single-brand callee never reads it.
+// HOST IS NOT ONE, and used to be listed here. Nothing in the frame carries a
+// host: the decoder reconstructs it from a Host HEADER, which the encoder was
+// dropping. Every request arrived with an empty Host — invisible, because a
+// single-brand callee never reads it.
 func isFrameOwnedHeaderBytes(key []byte) bool {
 	return bytesEqualFold(key, strContentLength) ||
 		bytesEqualFold(key, strTrailer)
