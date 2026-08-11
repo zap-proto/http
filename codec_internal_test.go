@@ -73,10 +73,10 @@ func TestHeaders_Empty(t *testing.T) {
 // become an out-of-range read.
 func TestHeaders_Truncated(t *testing.T) {
 	for name, raw := range map[string][]byte{
-		"short count":     {1, 0, 0},
+		"short count":       {1, 0, 0},
 		"name len past end": {1, 0, 0, 0, 9, 0, 0, 0, 'a', 'b'},
-		"missing value":   {1, 0, 0, 0, 1, 0, 0, 0, 'a'},
-		"value past end":  {1, 0, 0, 0, 1, 0, 0, 0, 'a', 9, 0, 0, 0, 'b'},
+		"missing value":     {1, 0, 0, 0, 1, 0, 0, 0, 'a'},
+		"value past end":    {1, 0, 0, 0, 1, 0, 0, 0, 'a', 9, 0, 0, 0, 'b'},
 	} {
 		if err := forEachHeader(raw, func(k, v []byte) {}); err == nil {
 			t.Errorf("%s: got nil error, want a truncation error", name)

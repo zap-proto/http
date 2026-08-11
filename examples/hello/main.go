@@ -13,7 +13,7 @@ import (
 	"os"
 
 	"github.com/valyala/fasthttp"
-	zaphttp "github.com/zap-proto/http"
+	http "github.com/zap-proto/http"
 )
 
 func main() {
@@ -25,17 +25,19 @@ func main() {
 
 	switch role {
 	case "server":
-		handler := func(ctx *fasthttp.RequestCtx) {
-			ctx.Response.Header.Set("Content-Type", "text/plain")
-			fmt.Fprintf(ctx, "hello from %s — you said %s %s\n", addr, ctx.Method(), ctx.Path())
-		}
+		// An ordinary net/http handler. Nothing here knows about ZAP — that is
+		// the point: the import changed and the code did not.
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprintf(w, "hello from %s — you said %s %s\n", addr, r.Method, r.URL.Path)
+		})
 		fmt.Printf("zap-http server listening on %s\n", addr)
-		if err := zaphttp.ListenAndServe(addr, handler); err != nil {
+		if err := http.ListenAndServe(addr, handler); err != nil {
 			fmt.Fprintln(os.Stderr, "server:", err)
 			os.Exit(1)
 		}
 	case "client":
-		resp, err := zaphttp.Get(addr, "/hello")
+		resp, err := http.Get(addr, "/hello")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "client:", err)
 			os.Exit(1)
