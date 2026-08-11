@@ -45,12 +45,6 @@ type Server struct {
 	closed   bool
 }
 
-// ListenAndServe is the convenience equivalent of fasthttp.ListenAndServe.
-func ListenAndServe(addr string, handler fasthttp.RequestHandler) error {
-	s := &Server{Addr: addr, Handler: handler}
-	return s.ListenAndServe()
-}
-
 // ListenAndServe binds Addr and serves until Close is called or a fatal
 // accept error occurs.
 func (s *Server) ListenAndServe() error {
