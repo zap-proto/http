@@ -1,0 +1,7 @@
+# zap-proto/http — ZAP over HTTP: the codec, the client and the server.
+# A library consumed by other modules, so there is no image to declare.
+test:
+  - name: build
+    run: go build ./...
+  - name: unit
+    run: go test ./... -count=1
