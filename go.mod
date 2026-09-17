@@ -1,6 +1,6 @@
 module github.com/zap-proto/http
 
-go 1.26
+go 1.27.1
 
 require (
 	github.com/valyala/fasthttp v1.70.0
