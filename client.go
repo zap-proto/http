@@ -20,6 +20,7 @@ package http
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -92,42 +93,72 @@ func (t *Transport) SetMaxIdleConns(n int) {
 // Do executes a single request/response exchange, filling resp. It is safe
 // for concurrent use: each call takes its own connection from the pool.
 func (t *Transport) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
+	return t.DoContext(context.Background(), req, resp)
+}
+
+// DoContext is Do bounded by ctx.
+//
+// The deadline caps the whole exchange, dial included. Cancellation closes the
+// connection, because a read already in flight has no other way to stop; the
+// conn is then discarded rather than pooled, and the error is ctx's cause.
+func (t *Transport) DoContext(ctx context.Context, req *fasthttp.Request, resp *fasthttp.Response) error {
 	if t.addr == "" {
 		return fmt.Errorf("http: Transport.addr is empty (use Dial)")
 	}
+	if err := ctx.Err(); err != nil {
+		return context.Cause(ctx)
+	}
 
-	pc, err := t.acquireConn()
+	pc, err := t.acquireConn(ctx)
 	if err != nil {
 		return fmt.Errorf("http: dial %s: %w", t.addr, err)
 	}
 	conn, br := pc.c, pc.br
+	if d, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(d)
+	}
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	// fail reports err, or ctx's cause when ctx is why the conn broke. The conn's
+	// deadline and ctx's timer are two clocks set to one instant, and the conn's
+	// can fire first; once that instant has passed the deadline is the reason.
+	fail := func(err error) error {
+		stop()
+		conn.Close()
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+		if d, ok := ctx.Deadline(); ok && !time.Now().Before(d) {
+			return context.DeadlineExceeded
+		}
+		return err
+	}
 
 	// Build [4-byte length prefix][request frame] in the conn's reused buffer and
 	// write it with a single syscall.
 	pc.wbuf = append(pc.wbuf[:0], 0, 0, 0, 0)
 	pc.wbuf, err = AppendRequest(pc.wbuf, req)
 	if err != nil {
-		conn.Close()
-		return err
+		return fail(err)
 	}
 	if err := writeFramePrefixed(conn, pc.wbuf); err != nil {
-		conn.Close()
-		return fmt.Errorf("http: write request: %w", err)
+		return fail(fmt.Errorf("http: write request: %w", err))
 	}
 
 	if t.readTimeout > 0 {
-		_ = conn.SetReadDeadline(time.Now().Add(t.readTimeout))
+		rd := time.Now().Add(t.readTimeout)
+		if d, ok := ctx.Deadline(); ok && d.Before(rd) {
+			rd = d
+		}
+		_ = conn.SetReadDeadline(rd)
 	}
 	pc.rbuf, err = readFrameInto(br, pc.rbuf)
 	if err != nil {
-		conn.Close()
-		return fmt.Errorf("http: read response: %w", err)
+		return fail(fmt.Errorf("http: read response: %w", err))
 	}
 	respFrame := pc.rbuf
 	ft, ok := frameType(respFrame)
 	if !ok {
-		conn.Close()
-		return fmt.Errorf("http: short response frame")
+		return fail(fmt.Errorf("http: short response frame"))
 	}
 
 	// Streamed response: apply the head, then attach a body stream that reads
@@ -137,21 +168,24 @@ func (t *Transport) Do(req *fasthttp.Request, resp *fasthttp.Response) error {
 	// keeps reading into it.
 	if ft == FrameResponseHead {
 		if err := UnmarshalResponseHead(respFrame, resp); err != nil {
-			conn.Close()
-			return fmt.Errorf("http: unmarshal response head: %w", err)
+			return fail(fmt.Errorf("http: unmarshal response head: %w", err))
 		}
-		resp.SetBodyStream(&streamReader{t: t, pc: pc, br: br}, -1)
+		// The body outlives this call, so ctx keeps its hold on the conn until
+		// the stream ends: a cancelled caller still stops a body mid-read.
+		resp.SetBodyStream(&streamReader{t: t, pc: pc, br: br, stop: stop}, -1)
 		return nil
 	}
 
 	if err := UnmarshalResponse(respFrame, resp); err != nil {
-		conn.Close()
-		return fmt.Errorf("http: unmarshal response: %w", err)
+		return fail(fmt.Errorf("http: unmarshal response: %w", err))
 	}
 
-	// Reset the read deadline and return the conn to the pool. The response
-	// is fully buffered in resp, so the conn is immediately reusable.
-	_ = conn.SetReadDeadline(time.Time{})
+	// Pool the conn only if cancellation has not already closed it.
+	if !stop() {
+		conn.Close()
+		return context.Cause(ctx)
+	}
+	_ = conn.SetDeadline(time.Time{})
 	t.releaseConn(pc)
 	return nil
 }
@@ -165,7 +199,8 @@ type streamReader struct {
 	t    *Transport
 	pc   *pooledConn
 	br   *bufio.Reader
-	rest []byte // undrained tail of the current chunk
+	stop func() bool // releases the request context's hold on the conn
+	rest []byte      // undrained tail of the current chunk
 	done bool
 	err  error
 }
@@ -219,7 +254,8 @@ func (s *streamReader) Read(p []byte) (int, error) {
 func (s *streamReader) Close() error {
 	if s.done {
 		s.release()
-	} else {
+	} else if s.pc != nil {
+		s.unhold()
 		s.pc.c.Close()
 	}
 	return nil
@@ -229,13 +265,29 @@ func (s *streamReader) release() {
 	if s.pc == nil {
 		return
 	}
-	_ = s.pc.c.SetReadDeadline(time.Time{})
+	if !s.unhold() {
+		s.pc.c.Close() // cancellation already closed it; never pool a dead conn
+		s.pc = nil
+		return
+	}
+	_ = s.pc.c.SetDeadline(time.Time{})
 	s.t.releaseConn(s.pc)
 	s.pc = nil
 }
 
+// unhold releases the request context's hold on the conn, and reports whether
+// the conn is still open.
+func (s *streamReader) unhold() bool {
+	if s.stop == nil {
+		return true
+	}
+	ok := s.stop()
+	s.stop = nil
+	return ok
+}
+
 // acquireConn pops an idle conn or dials a new one.
-func (t *Transport) acquireConn() (*pooledConn, error) {
+func (t *Transport) acquireConn(ctx context.Context) (*pooledConn, error) {
 	t.mu.Lock()
 	if n := len(t.idle); n > 0 {
 		pc := t.idle[n-1]
@@ -245,7 +297,8 @@ func (t *Transport) acquireConn() (*pooledConn, error) {
 	}
 	t.mu.Unlock()
 
-	c, err := net.DialTimeout(t.network, t.addr, t.dialTimeout)
+	d := net.Dialer{Timeout: t.dialTimeout}
+	c, err := d.DialContext(ctx, t.network, t.addr)
 	if err != nil {
 		return nil, err
 	}
