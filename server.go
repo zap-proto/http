@@ -115,6 +115,11 @@ func (s *Server) serveConn(conn net.Conn) {
 	// attached for reuse; Request and Response are reset per request below.
 	ctx := &fasthttp.RequestCtx{}
 	ctx.Init2(conn, s.Logger, false)
+	// A streamed body is closed when it has been written, or by the next
+	// request's Reset. A connection that ends before either — the caller left
+	// before the head went out — would leave it open, and with it whatever the
+	// handler holds until its stream closes: a proxied upstream, a request count.
+	defer func() { _ = ctx.Response.CloseBodyStream() }()
 
 	// Per-connection scratch buffers: the inbound frame is decoded straight into
 	// ctx.Request (which copies out what it keeps), and the response frame is
